@@ -253,6 +253,28 @@ function handleIdentity(
 }
 
 /**
+ * Re-reads the conversation an unpublished handle belongs to, as of now, and
+ * records the answer.
+ *
+ * A held record's identity is not settled when the record is created. The
+ * handle can first report its conversation while the very disposal letting go
+ * of it is still in flight, or after that disposal has already failed — so
+ * every boundary that matches a record against a conversation, or reports one,
+ * has to ask the handle rather than trust the id cached at acquisition.
+ * Matching on the cached answer alone is what let an explicit load of a
+ * conversation whose handle was still nameless at release time skip the wait
+ * and start a second runtime behind the unreleased first.
+ *
+ * The original bound id always wins, so a caller-supplied identity is never
+ * replaced, and the answer is still read from the handle, so a conversation the
+ * runtime genuinely never reported stays unknown instead of being invented.
+ */
+function reviewIdentity(record: UnpublishedRuntime): string | null {
+  record.sessionId = handleIdentity(record.sessionId, record.session);
+  return record.sessionId;
+}
+
+/**
  * Raised when a conversation's previous runtime could not be released.
  *
  * Eviction exists to stop idle runtimes from accumulating, so a failed
@@ -1279,19 +1301,13 @@ export class LettaAcpAgent {
       error: undefined,
       finalClose: "not_attempted",
     };
-    // Identity is reviewed again once the disposal settles, not only when the
-    // handle was acquired: a runtime can report its conversation while the
-    // release letting go of it is still in flight, and a rejected release
-    // leaves this record holding the handle for the life of the process. Still
-    // read from the handle, so an id that never arrives stays unknown.
-    const reviewIdentity = (): string => {
-      record.sessionId = handleIdentity(record.sessionId, session);
-      return describeHandle(record.sessionId);
-    };
+    // Identity is reviewed as the disposal settles, not only when the handle
+    // was acquired, and at every boundary that matches this record afterwards
+    // — see {@link reviewIdentity}.
     this.beginRelease(
       record,
       (error) =>
-        `releasing unpublished runtime for ${reviewIdentity()} failed; holding it: ${String(error)}`,
+        `releasing unpublished runtime for ${describeHandle(reviewIdentity(record))} failed; holding it: ${String(error)}`,
     );
     this.unpublished.add(record);
     void record.settled.then(() => {
@@ -1303,7 +1319,7 @@ export class LettaAcpAgent {
       // after shutdown has no later request to fail closed for, and shutdown
       // itself could only see a record that had already settled.
       if (this.shuttingDown) {
-        this.releaseHeldRuntime(reviewIdentity(), record);
+        this.releaseHeldRuntime(describeHandle(reviewIdentity(record)), record);
       }
     });
   }
@@ -1426,20 +1442,47 @@ export class LettaAcpAgent {
    */
   private async awaitRetirement(sessionId: string): Promise<void> {
     const record = this.retiring.get(sessionId);
-    const unpublished = [...this.unpublished].filter(
-      (held) => held.sessionId === sessionId,
-    );
-    await Promise.all([
-      record?.settled,
-      ...unpublished.map((held) => held.settled),
-    ]);
+    const awaited = new Set<UnpublishedRuntime>();
+    let matching = this.unpublishedFor(sessionId);
+    // Matches are re-collected after every wait rather than once on entry. A
+    // handle that was still nameless when its release began can report this
+    // very conversation while that release is pending, so the set of runtimes
+    // standing in front of a reopen is not knowable until they have settled.
+    // Each record is waited on at most once, so this walks the handles held at
+    // the time and then stops.
+    do {
+      for (const held of matching) awaited.add(held);
+      await Promise.all([
+        record?.settled,
+        ...matching.map((held) => held.settled),
+      ]);
+      matching = this.unpublishedFor(sessionId).filter(
+        (held) => !awaited.has(held),
+      );
+    } while (matching.length > 0);
     if (record?.failed) {
       throw new SessionRetirementError(sessionId, record.error);
     }
-    const unreleased = unpublished.find((held) => held.failed);
+    const unreleased = [...awaited].find((held) => held.failed);
     if (unreleased) {
       throw new SessionRetirementError(sessionId, unreleased.error);
     }
+  }
+
+  /**
+   * The unpublished handles that belong to this conversation as of now, each
+   * asked for its identity rather than matched on the id it was recorded with
+   * (see {@link reviewIdentity}).
+   *
+   * A handle that has never reported a conversation matches nothing: an unknown
+   * identity stays unknown rather than standing in for the id being looked up.
+   */
+  private unpublishedFor(sessionId: string): UnpublishedRuntime[] {
+    const held: UnpublishedRuntime[] = [];
+    for (const record of this.unpublished) {
+      if (reviewIdentity(record) === sessionId) held.push(record);
+    }
+    return held;
   }
 
   /**
@@ -1463,7 +1506,10 @@ export class LettaAcpAgent {
     }
     for (const record of this.unpublished) {
       if (record.failed) {
-        held.push({ sessionId: record.sessionId, error: record.error });
+        // Asked rather than replayed: an identity that only arrived after the
+        // disposal failed is the difference between an operator seeing which
+        // conversation is unreconciled and seeing an anonymous handle.
+        held.push({ sessionId: reviewIdentity(record), error: record.error });
       }
     }
     return held;
@@ -1476,10 +1522,7 @@ export class LettaAcpAgent {
   private unreleasedRuntimeFor(sessionId: string): HeldRuntime | undefined {
     const retiring = this.retiring.get(sessionId);
     if (retiring?.failed) return retiring;
-    for (const record of this.unpublished) {
-      if (record.failed && record.sessionId === sessionId) return record;
-    }
-    return undefined;
+    return this.unpublishedFor(sessionId).find((held) => held.failed);
   }
 
   /**
@@ -1636,7 +1679,7 @@ export class LettaAcpAgent {
     // caller ever saw them, so shutdown is the last place that can let go.
     for (const record of this.unpublished) {
       if (!record.failed) continue;
-      this.releaseHeldRuntime(describeHandle(record.sessionId), record);
+      this.releaseHeldRuntime(describeHandle(reviewIdentity(record)), record);
     }
   }
 

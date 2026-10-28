@@ -3003,6 +3003,193 @@ describe("idle session eviction", () => {
     }
   });
 
+  test("review regression: identity reported during pending disposal fences load immediately", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const client = (agent as unknown as { client: SdkClientHandle }).client;
+    const create = client.createSession.bind(client);
+    let discovered: string | null = null;
+    let revealIdentity = false;
+    let cleanup: (() => Promise<void>) | undefined;
+    client.createSession = (id, options) => {
+      const session = create(id, options);
+      cleanup = session[Symbol.asyncDispose]?.bind(session);
+      const runtime = session as unknown as {
+        conversationId: string | null;
+        bootstrapState: (...args: unknown[]) => Promise<unknown>;
+      };
+      const bootstrap = runtime.bootstrapState.bind(runtime);
+      runtime.bootstrapState = async (...args) => {
+        await bootstrap(...args);
+        discovered = runtime.conversationId;
+        // Fault injection: the SDK only reports the identity after the
+        // adapter has entered cleanup, while that cleanup is still pending.
+        Object.defineProperty(session, "conversationId", {
+          configurable: true,
+          get: () => revealIdentity ? discovered : null,
+        });
+        throw new Error("injected late identity bootstrap failure");
+      };
+      return session;
+    };
+    let load: Promise<unknown> | undefined;
+    const failure = new Error("injected pending disposal failure");
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const disposal = sdk.deferNextDisposal();
+      await expect(agent.newSession({ cwd: "/tmp/letta-acp-test", mcpServers: [] }, context))
+        .rejects.toThrow("injected late identity bootstrap failure");
+      await waitFor("unpublished disposal pending", () => disposal.started);
+      expect(discovered).toBeTruthy();
+      revealIdentity = true;
+      let settled = false;
+      load = agent.loadSession({ sessionId: discovered!, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context)
+        .then(() => "resolved", (error: unknown) => error)
+        .finally(() => { settled = true; });
+      await Bun.sleep(50);
+      const startsWhilePending = server.runtimeStartMessages.length;
+      const settledWhilePending = settled;
+      disposal.reject(failure);
+      const outcome = await load;
+      expect(startsWhilePending).toBe(1);
+      expect(settledWhilePending).toBe(false);
+      expect(outcome).toBeInstanceOf(SessionRetirementError);
+    } finally {
+      agent.shutdown();
+      await load;
+      await cleanup?.();
+    }
+  });
+
+  test("identity reported after a failed disposal still names and fences its conversation", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const client = (agent as unknown as { client: SdkClientHandle }).client;
+    const create = client.createSession.bind(client);
+    let discovered: string | null = null;
+    let revealIdentity = false;
+    let cleanup: (() => Promise<void>) | undefined;
+    client.createSession = (id, options) => {
+      const session = create(id, options);
+      cleanup = session[Symbol.asyncDispose]?.bind(session);
+      const runtime = session as unknown as {
+        conversationId: string | null;
+        bootstrapState: (...args: unknown[]) => Promise<unknown>;
+      };
+      const bootstrap = runtime.bootstrapState.bind(runtime);
+      runtime.bootstrapState = async (...args) => {
+        await bootstrap(...args);
+        discovered = runtime.conversationId;
+        // Fault injection: the identity stays hidden until after the disposal
+        // has already rejected — later than any boundary that could have
+        // recorded it while the release was still in flight.
+        Object.defineProperty(session, "conversationId", {
+          configurable: true,
+          get: () => (revealIdentity ? discovered : null),
+        });
+        throw new Error("injected post-failure identity bootstrap failure");
+      };
+      return session;
+    };
+    const failure = new Error("injected settled disposal failure");
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const disposal = sdk.deferNextDisposal();
+      await expect(agent.newSession({ cwd: "/tmp/letta-acp-test", mcpServers: [] }, context))
+        .rejects.toThrow("injected post-failure identity bootstrap failure");
+      await waitFor("unpublished disposal pending", () => disposal.started);
+      disposal.reject(failure);
+      await waitFor("the unreleased runtime to be recorded", () => agent.unreleasedRuntimes().length === 1);
+      // Nothing has reported a conversation yet, so the record names none
+      // rather than inventing one.
+      expect(agent.unreleasedRuntimes()).toEqual([{ sessionId: null, error: failure }]);
+      revealIdentity = true;
+      expect(discovered).toBeTruthy();
+      // Still diagnosable: the held runtime is named as soon as its handle
+      // reports the conversation, even though the failure is already settled.
+      expect(agent.unreleasedRuntimes()).toEqual([{ sessionId: discovered!, error: failure }]);
+      // And still fencing: the reopen is refused rather than put behind the
+      // runtime nothing released.
+      const outcome = await agent.loadSession({ sessionId: discovered!, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context)
+        .then(() => "resolved", (error: unknown) => error);
+      expect(outcome).toBeInstanceOf(SessionRetirementError);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      // The fence is scoped to the conversation the handle reported, so an
+      // unrelated one is still admissible.
+      await loadConversation(agent, context, "conv-unrelated-admissible");
+      expect(server.runtimeStartMessages).toHaveLength(2);
+    } finally {
+      agent.shutdown();
+      await cleanup?.();
+    }
+  });
+
+  test("identity reported during a disposal that succeeds waits, then permits one reopen", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const client = (agent as unknown as { client: SdkClientHandle }).client;
+    const create = client.createSession.bind(client);
+    let discovered: string | null = null;
+    let revealIdentity = false;
+    let cleanup: (() => Promise<void>) | undefined;
+    client.createSession = (id, options) => {
+      const session = create(id, options);
+      cleanup = session[Symbol.asyncDispose]?.bind(session);
+      const runtime = session as unknown as {
+        conversationId: string | null;
+        bootstrapState: (...args: unknown[]) => Promise<unknown>;
+      };
+      const bootstrap = runtime.bootstrapState.bind(runtime);
+      runtime.bootstrapState = async (...args) => {
+        await bootstrap(...args);
+        discovered = runtime.conversationId;
+        Object.defineProperty(session, "conversationId", {
+          configurable: true,
+          get: () => (revealIdentity ? discovered : null),
+        });
+        throw new Error("injected late identity bootstrap failure");
+      };
+      return session;
+    };
+    let load: Promise<unknown> | undefined;
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const disposal = sdk.deferNextDisposal();
+      await expect(agent.newSession({ cwd: "/tmp/letta-acp-test", mcpServers: [] }, context))
+        .rejects.toThrow("injected late identity bootstrap failure");
+      await waitFor("unpublished disposal pending", () => disposal.started);
+      expect(discovered).toBeTruthy();
+      revealIdentity = true;
+      let settled = false;
+      load = agent.loadSession({ sessionId: discovered!, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context)
+        .then(() => "resolved", (error: unknown) => error)
+        .finally(() => { settled = true; });
+      await Bun.sleep(50);
+      const startsWhilePending = server.runtimeStartMessages.length;
+      const settledWhilePending = settled;
+      disposal.resolve();
+      const outcome = await load;
+      // Waiting on the late identity is not refusing it: the load parks on the
+      // pending release, and a release that succeeds lets it through to open
+      // exactly one replacement rather than a second runtime behind the first.
+      expect(startsWhilePending).toBe(1);
+      expect(settledWhilePending).toBe(false);
+      expect(outcome).toBe("resolved");
+      expect(server.runtimeStartMessages).toHaveLength(2);
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+    } finally {
+      agent.shutdown();
+      await load;
+      await cleanup?.();
+    }
+  });
+
   test("a new-session bootstrap failing before any identity keeps its runtime nameless", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
