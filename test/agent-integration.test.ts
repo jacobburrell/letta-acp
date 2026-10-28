@@ -2957,6 +2957,121 @@ describe("idle session eviction", () => {
     }
   });
 
+  test("review regression: failed new-session bootstrap retains its discovered identity", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const client = (agent as unknown as { client: SdkClientHandle }).client;
+    const create = client.createSession.bind(client);
+    let discovered: string | undefined;
+    let cleanup: (() => Promise<void>) | undefined;
+    client.createSession = (id, options) => {
+      const session = create(id, options);
+      cleanup = session[Symbol.asyncDispose]?.bind(session);
+      const runtime = session as unknown as {
+        conversationId: string;
+        bootstrapState: (...args: unknown[]) => Promise<unknown>;
+      };
+      const bootstrap = runtime.bootstrapState.bind(runtime);
+      runtime.bootstrapState = async (...args) => {
+        await bootstrap(...args);
+        discovered = runtime.conversationId;
+        throw new Error("injected new-session bootstrap failure");
+      };
+      return session;
+    };
+    const failure = new Error("injected disposal failure");
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const disposal = sdk.deferNextDisposal();
+      await expect(agent.newSession({ cwd: "/tmp/letta-acp-test", mcpServers: [] }, context))
+        .rejects.toThrow("injected new-session bootstrap failure");
+      expect(typeof discovered).toBe("string");
+      await waitFor("failed new-session disposal", () => disposal.started);
+      disposal.reject(failure);
+      await waitFor("retained new-session runtime", () => agent.unreleasedRuntimes().length === 1);
+      // A known runtime identity must fence a subsequent explicit load too.
+      const outcome = await agent.loadSession({ sessionId: discovered!, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context)
+        .then(() => "resolved", (error: unknown) => error);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      expect(outcome).toBeInstanceOf(SessionRetirementError);
+      expect(agent.unreleasedRuntimes()).toEqual([{ sessionId: discovered!, error: failure }]);
+    } finally {
+      agent.shutdown();
+      await cleanup?.();
+    }
+  });
+
+  test("a new-session bootstrap failing before any identity keeps its runtime nameless", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const client = (agent as unknown as { client: SdkClientHandle }).client;
+    const create = client.createSession.bind(client);
+    let reported: string | null | undefined;
+    client.createSession = (id, options) => {
+      const session = create(id, options);
+      const runtime = session as unknown as {
+        conversationId: string | null;
+        bootstrapState: (...args: unknown[]) => Promise<unknown>;
+      };
+      // Rejects without running the real bootstrap, so this runtime never
+      // reports a conversation at all — the other half of the discovered-id
+      // case above.
+      runtime.bootstrapState = async () => {
+        reported = runtime.conversationId;
+        throw new Error("injected pre-identity bootstrap failure");
+      };
+      return session;
+    };
+    const failure = new Error("injected disposal failure");
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const disposal = sdk.deferNextDisposal();
+      await expect(agent.newSession({ cwd: "/tmp/letta-acp-test", mcpServers: [] }, context))
+        .rejects.toThrow("injected pre-identity bootstrap failure");
+      expect(reported).toBeFalsy();
+      await waitFor("the nameless handle's release to start", () => disposal.started);
+      disposal.reject(failure);
+      await waitFor("the unreleased runtime to be recorded", () => agent.unreleasedRuntimes().length === 1);
+      // Binding identity from the handle must not invent one. An unknown
+      // conversation stays unknown, and the handle is still accounted for
+      // because these records are held by identity, not by conversation.
+      expect(agent.unreleasedRuntimes()).toEqual([{ sessionId: null, error: failure }]);
+      expect(server.runtimeStartMessages).toHaveLength(0);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("review regression: shutdown preserves disposal uncertainty after socket close", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const failure = new Error("injected disposal failure");
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      failBootstrapWith(agent, new Error("injected bootstrap read failure"));
+      const disposal = sdk.deferNextDisposal();
+      await expect(agent.loadSession({ sessionId: "conv-teardown-uncertain", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context))
+        .rejects.toThrow("injected bootstrap read failure");
+      await waitFor("disposal start", () => disposal.started);
+      disposal.reject(failure);
+      await waitFor("disposal failure record", () => agent.unreleasedRuntimes().length === 1);
+      const closed = server.closedSockets;
+      agent.shutdown();
+      await waitFor("socket close", () => server.closedSockets > closed);
+      // Socket closure is not successful asynchronous teardown. No OS-process
+      // claim is made by this fixture; the original uncertainty must survive.
+      expect(agent.unreleasedRuntimes()).toEqual([{ sessionId: "conv-teardown-uncertain", error: failure }]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
   test("a bootstrap rejection releases the runtime it had already started", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server, {
@@ -3049,9 +3164,21 @@ describe("idle session eviction", () => {
       expect(server.runtimeStartMessages).toHaveLength(1);
 
       // Shutdown is where the handle is finally let go, as it is for a failed
-      // retirement.
+      // retirement. Letting go of it is all that establishes, though: the
+      // disposal that would have waited for this runtime's teardown is the one
+      // that rejected, so the uncertainty it left stays named rather than being
+      // cleared by a synchronous close. (This expectation previously read
+      // `toEqual([])`, which reported a runtime nobody proved dead
+      // indistinguishably from one a successful awaited disposal had released.)
+      const closedBeforeShutdown = server.closedSockets;
       agent.shutdown();
-      expect(agent.unreleasedRuntimes()).toEqual([]);
+      await waitFor(
+        "shutdown to let go of the held handle",
+        () => server.closedSockets > closedBeforeShutdown,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual([
+        { sessionId: "conv-bootstrap-held", error: failure },
+      ]);
     } finally {
       agent.shutdown();
     }
@@ -3402,13 +3529,22 @@ describe("idle session eviction", () => {
         { sessionId: "conv-close-failure", error: failure },
       ]);
 
-      // Shutdown releases the handle it kept: a dropped one could not be closed.
+      // Shutdown lets go of the handle it kept: a dropped one could not be
+      // closed.
       agent.shutdown();
       await waitFor(
         "shutdown to release the retained runtime",
         () => server.closedSockets > closedBefore,
       );
-      expect(agent.unreleasedRuntimes()).toEqual([]);
+      // But the close is synchronous, and the asynchronous disposal that would
+      // have waited for this runtime's subprocesses is the one that rejected.
+      // So the handle is accounted for and the teardown still is not, and the
+      // original failure stays inspectable. (This expectation previously read
+      // `toEqual([])`; an empty list here claimed resolution that no close on
+      // this path can establish.)
+      expect(agent.unreleasedRuntimes()).toEqual([
+        { sessionId: "conv-close-failure", error: failure },
+      ]);
     } finally {
       agent.shutdown();
     }

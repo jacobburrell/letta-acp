@@ -196,10 +196,16 @@ interface HeldRuntime {
   /** The rejection, kept for diagnostics and for the error callers receive. */
   error: unknown;
   /**
-   * True once shutdown's final close has been attempted for this runtime, so a
-   * repeated shutdown cannot close it twice or overwrite the first outcome.
+   * What shutdown's final close did with the handle, attempted at most once so
+   * a repeated shutdown cannot close it twice or overwrite the first outcome.
+   *
+   * Deliberately separate from {@link failed} and {@link error}, which record
+   * the teardown outcome. The two answer different questions: whether this
+   * adapter still holds an open handle, and whether anything established that
+   * the runtime behind it was torn down. A returning `close()` settles only the
+   * first.
    */
-  finalCloseAttempted: boolean;
+  finalClose: "not_attempted" | "handle_released" | "close_failed";
 }
 
 /**
@@ -220,6 +226,30 @@ interface UnpublishedRuntime extends HeldRuntime {
 /** Names a held runtime in logs, including one with no conversation id yet. */
 function describeHandle(sessionId: string | null): string {
   return sessionId ?? "a session with no conversation id";
+}
+
+/**
+ * The conversation a handle belongs to: the id its caller already bound, or
+ * failing that the one the SDK handle itself reports.
+ *
+ * `session/new` has no conversation id of its own, so the binding that gives
+ * the handle one sits after the bootstrap await that can reject — which left an
+ * initialization failing late holding a handle the SDK had already named, while
+ * recording it as nameless. A nameless record fences nothing: `session/load`
+ * for that very conversation matched no held runtime and opened a second one
+ * behind the unreleased first. Asking the handle keeps the identity it
+ * discovered. It is read rather than derived, so a conversation the runtime
+ * genuinely never reported stays unknown instead of being fabricated —
+ * `conversationId` is `string | null` on the SDK handle, backed by a plain
+ * getter that keeps answering after the session is closed.
+ */
+function handleIdentity(
+  bound: string | null,
+  session: LettaCodeSession,
+): string | null {
+  // Matches openSession's own `!sessionId` check: the empty string is not an
+  // identity either.
+  return bound || session.conversationId || null;
 }
 
 /**
@@ -754,7 +784,11 @@ export class LettaAcpAgent {
       return { sessionId, state };
     } catch (error) {
       state?.removeDeviceStatusListener?.();
-      this.releaseUnpublished(opened, session);
+      // `opened` is this call's own binding, which the bootstrap await above
+      // can reject before reaching. The handle may still have discovered its
+      // conversation by then, and that identity is what fences a later reopen
+      // of the same conversation — see {@link handleIdentity}.
+      this.releaseUnpublished(handleIdentity(opened, session), session);
       throw error;
     }
   }
@@ -1237,18 +1271,27 @@ export class LettaAcpAgent {
     sessionId: string | null,
     session: LettaCodeSession,
   ): void {
-    const named = describeHandle(sessionId);
-    const record = this.beginRelease<UnpublishedRuntime>(
-      {
-        session,
-        sessionId,
-        settled: Promise.resolve(),
-        failed: false,
-        error: undefined,
-        finalCloseAttempted: false,
-      },
+    const record: UnpublishedRuntime = {
+      session,
+      sessionId,
+      settled: Promise.resolve(),
+      failed: false,
+      error: undefined,
+      finalClose: "not_attempted",
+    };
+    // Identity is reviewed again once the disposal settles, not only when the
+    // handle was acquired: a runtime can report its conversation while the
+    // release letting go of it is still in flight, and a rejected release
+    // leaves this record holding the handle for the life of the process. Still
+    // read from the handle, so an id that never arrives stays unknown.
+    const reviewIdentity = (): string => {
+      record.sessionId = handleIdentity(record.sessionId, session);
+      return describeHandle(record.sessionId);
+    };
+    this.beginRelease(
+      record,
       (error) =>
-        `releasing unpublished runtime for ${named} failed; holding it: ${String(error)}`,
+        `releasing unpublished runtime for ${reviewIdentity()} failed; holding it: ${String(error)}`,
     );
     this.unpublished.add(record);
     void record.settled.then(() => {
@@ -1260,9 +1303,7 @@ export class LettaAcpAgent {
       // after shutdown has no later request to fail closed for, and shutdown
       // itself could only see a record that had already settled.
       if (this.shuttingDown) {
-        this.releaseHeldRuntime(named, record, () =>
-          this.unpublished.delete(record),
-        );
+        this.releaseHeldRuntime(reviewIdentity(), record);
       }
     });
   }
@@ -1288,7 +1329,7 @@ export class LettaAcpAgent {
         settled: Promise.resolve(),
         failed: false,
         error: undefined,
-        finalCloseAttempted: false,
+        finalClose: "not_attempted",
       },
       (error) =>
         `releasing session ${sessionId} failed; holding its runtime: ${String(error)}`,
@@ -1307,7 +1348,7 @@ export class LettaAcpAgent {
       // A disposal that rejects after shutdown has no later request to fail
       // closed for either, so shutdown's final release has to cover it from
       // here: shutdown itself could only see a record that had not settled yet.
-      if (this.shuttingDown) this.releaseHeldRuntime(sessionId, record, forget);
+      if (this.shuttingDown) this.releaseHeldRuntime(sessionId, record);
     });
     return record;
   }
@@ -1324,29 +1365,34 @@ export class LettaAcpAgent {
    * What a returning `close()` establishes is narrow: this adapter let go of
    * the handle and its app-server socket without erroring. It is not evidence
    * that the app-server child process or the per-session MCP subprocesses
-   * died — only async disposal waits for that teardown, and the reason this
-   * runtime is here is that disposal rejected. The record is dropped anyway
-   * because nothing further is available to do with the handle, not because
-   * anything was proved about the processes behind it; `close()` throwing is
-   * the one case where the handle itself is still unaccounted for, so the
-   * record stays and {@link unreleasedRuntimes} keeps naming it. Attempted at
-   * most once per runtime, so a repeated shutdown neither closes again nor
-   * rewrites the first outcome.
+   * died. In the installed SDK, `close()` is synchronous and idempotent: it
+   * *starts* the MCP bridge teardown and keeps the promise, while only
+   * `Symbol.asyncDispose` — `close()` followed by awaiting that same promise —
+   * waits for it. So for the runtimes that reach here the close is weaker
+   * still, because the disposal that rejected had already run `close()` itself;
+   * a second one takes the `closed` early return and reports nothing about the
+   * teardown that failed.
+   *
+   * The outcome is therefore recorded on the handle's own axis
+   * ({@link HeldRuntime.finalClose}) and the record is kept either way, so the
+   * unresolved teardown that put the runtime here stays inspectable through
+   * {@link unreleasedRuntimes} with its original error. Dropping it on a
+   * returning `close()` is what made an at-most-once synchronous close read as
+   * resolution: it reported the same empty list as a runtime whose awaited
+   * async disposal really had torn down its subprocesses. Nothing is retried or
+   * reopened to establish more; a record is cleared only by its own successful
+   * awaited disposal, which is the one thing that does wait for teardown.
    */
-  private releaseHeldRuntime(
-    named: string,
-    record: HeldRuntime,
-    forget: () => void,
-  ): void {
-    if (record.finalCloseAttempted) return;
-    record.finalCloseAttempted = true;
+  private releaseHeldRuntime(named: string, record: HeldRuntime): void {
+    if (record.finalClose !== "not_attempted") return;
     try {
       record.session.close();
     } catch (error) {
+      record.finalClose = "close_failed";
       log(`closing held runtime for ${named} failed: ${String(error)}`);
       return;
     }
-    forget();
+    record.finalClose = "handle_released";
   }
 
   /**
@@ -1402,6 +1448,13 @@ export class LettaAcpAgent {
    *
    * These are refusing to reopen, so surface them rather than leaving an
    * operator to infer them from the log.
+   *
+   * An entry reports unresolved teardown, not an open handle: it is cleared
+   * only by a release that was awaited to success, and shutdown's final
+   * `close()` does not clear it (see {@link releaseHeldRuntime}). So an empty
+   * list means every runtime this adapter started was accounted for, and a
+   * non-empty one after shutdown still names the teardown nothing established
+   * — which is the point, since by then there is no request left to refuse.
    */
   unreleasedRuntimes(): Array<{ sessionId: string | null; error: unknown }> {
     const held: Array<{ sessionId: string | null; error: unknown }> = [];
@@ -1571,21 +1624,19 @@ export class LettaAcpAgent {
     // hide it from `unreleasedRuntimes()` as well. `retireSession` releases
     // those as they settle, which is also why nothing clears the map — what
     // remains in it is exactly what this adapter could not release.
-    for (const [sessionId, record] of [...this.retiring]) {
+    //
+    // Letting go of the handle is also not the same as reconciling the runtime,
+    // so these records outlive this loop rather than being cleared by it: see
+    // {@link releaseHeldRuntime}.
+    for (const [sessionId, record] of this.retiring) {
       if (!record.failed) continue;
-      this.releaseHeldRuntime(sessionId, record, () => {
-        if (this.retiring.get(sessionId) === record) {
-          this.retiring.delete(sessionId);
-        }
-      });
+      this.releaseHeldRuntime(sessionId, record);
     }
     // Handles an initialization never published are in the same position: no
     // caller ever saw them, so shutdown is the last place that can let go.
-    for (const record of [...this.unpublished]) {
+    for (const record of this.unpublished) {
       if (!record.failed) continue;
-      this.releaseHeldRuntime(describeHandle(record.sessionId), record, () =>
-        this.unpublished.delete(record),
-      );
+      this.releaseHeldRuntime(describeHandle(record.sessionId), record);
     }
   }
 
