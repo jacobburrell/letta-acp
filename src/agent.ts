@@ -187,7 +187,7 @@ const IMAGE_MEDIA_TYPES = new Set([
  * the life of the process: a runtime nobody proved dead is still holding an
  * app-server child process and its MCP subprocesses.
  */
-interface RetiringRuntime {
+interface HeldRuntime {
   session: LettaCodeSession;
   /** Resolves when the disposal attempt has finished, successfully or not. */
   settled: Promise<void>;
@@ -200,6 +200,26 @@ interface RetiringRuntime {
    * repeated shutdown cannot close it twice or overwrite the first outcome.
    */
   finalCloseAttempted: boolean;
+}
+
+/**
+ * A runtime {@link LettaAcpAgent.openSession} started but never published.
+ *
+ * Conversation-keyed retirement cannot represent these. A `session/new` handle
+ * has no conversation id until its runtime reports one, and an initialization
+ * that fails after displacing a live session leaves a second handle on a
+ * conversation whose retirement record is already owned by the runtime it
+ * displaced — keying by conversation would overwrite that record and lose the
+ * failure it holds. So these are held by identity instead, each carrying the
+ * conversation it belongs to when one is known.
+ */
+interface UnpublishedRuntime extends HeldRuntime {
+  sessionId: string | null;
+}
+
+/** Names a held runtime in logs, including one with no conversation id yet. */
+function describeHandle(sessionId: string | null): string {
+  return sessionId ?? "a session with no conversation id";
 }
 
 /**
@@ -247,7 +267,12 @@ export class LettaAcpAgent {
    * Runtimes being released, keyed by conversation. A reopen waits for the
    * entry; a failed one stays, so nothing can get behind it.
    */
-  private readonly retiring = new Map<string, RetiringRuntime>();
+  private readonly retiring = new Map<string, HeldRuntime>();
+  /**
+   * Runtimes an initialization owned but never published, held by identity so
+   * an unnamed handle and a second handle on one conversation both fit.
+   */
+  private readonly unpublished = new Set<UnpublishedRuntime>();
   /** Operations in progress per conversation, held before their first await. */
   private readonly holds = new Map<string, number>();
   private idleSweep: ReturnType<typeof setInterval> | null = null;
@@ -646,96 +671,92 @@ export class LettaAcpAgent {
     const session = options.resumeId
       ? this.client.resumeSession(options.resumeId, sessionOptions)
       : this.client.createSession(options.agentId ?? "", sessionOptions);
-    // Force runtime initialization so the conversation id and active model exist.
-    const bootstrap = await session.bootstrapState({ limit: 1 });
-    const sessionId = options.resumeId ?? session.conversationId;
-    if (!sessionId) {
-      session.close();
-      throw new Error("Letta session did not report a conversation id");
-    }
-    ref.sessionId = sessionId;
-    if (editorTools.length > 0) {
-      log(
-        `editor fs tools enabled: ${editorTools.map((tool) => tool.name).join(", ")}`,
-      );
-    }
-    const state: AcpSessionState = {
-      session,
-      clientContext: options.clientContext,
-      lastToolCall: null,
-      toolCalls: new Map(),
-      alwaysAllowed: new Set(),
-      cancelled: false,
-      promptActive: false,
-      modeId: this.config.permissionMode,
-      cwd: options.cwd,
-      currentModel: bootstrap.model ?? this.config.model,
-      mcpServers: options.mcpServers,
-      pendingPermissions: 0,
-      lastActivityAt: Date.now(),
-      removeDeviceStatusListener: null,
-    };
-    // Runtime-side work that this adapter is not driving — a run still
-    // streaming after a turn returned, or an approval the device is waiting on
-    // — is only visible through device status. Each update refreshes the idle
-    // deadline rather than pinning the session outright: a live run keeps
-    // producing updates, while a run the runtime abandoned goes quiet and
-    // becomes evictable instead of holding its child process forever.
-    state.removeDeviceStatusListener = session.onDeviceStatus((status) => {
-      const live = this.sessions.get(sessionId);
-      if (live !== state) return;
-      if (status.isProcessing || status.pendingControlRequests.length > 0) {
-        state.lastActivityAt = Date.now();
+    // Ownership bracket. The handle exists from this line on, holding an
+    // app-server socket and whatever the runtime spawned behind it, and
+    // nothing else can see it until the publication below. So acquisition and
+    // publication are one lifetime rather than a series of guarded steps:
+    // every way out before publication — bootstrap, a missing conversation id,
+    // `prepare`, a displaced runtime's retirement, the shutdown fence — leaves
+    // through the same catch, which releases the handle or keeps it
+    // inspectable and rethrows the original failure. Guarding the steps
+    // individually is what left bootstrap's own rejection dropping a runtime
+    // nobody could name.
+    let opened: string | null = options.resumeId;
+    let state: AcpSessionState | null = null;
+    try {
+      // Force runtime initialization so the conversation id and active model exist.
+      const bootstrap = await session.bootstrapState({ limit: 1 });
+      const sessionId = options.resumeId ?? session.conversationId;
+      if (!sessionId) {
+        throw new Error("Letta session did not report a conversation id");
       }
-    });
-    if (options.prepare) {
-      try {
-        await options.prepare(state);
-      } catch (error) {
-        // Nothing has seen this session, so it is this call's to clean up.
-        state.removeDeviceStatusListener?.();
-        await this.discardSession(sessionId, session);
-        throw error;
+      opened = sessionId;
+      ref.sessionId = sessionId;
+      if (editorTools.length > 0) {
+        log(
+          `editor fs tools enabled: ${editorTools.map((tool) => tool.name).join(", ")}`,
+        );
       }
-    }
-    // A client may load the same conversation again while its prior ACP
-    // session is still open. Retire the displaced SDK session before replacing
-    // it so its sockets and per-session MCP subprocesses are not orphaned —
-    // and if that retirement fails, discard this replacement instead of
-    // leaving two runtimes on one conversation.
-    const displaced = this.sessions.get(sessionId);
-    if (displaced && displaced.session !== session) {
-      this.sessions.delete(sessionId);
-      displaced.removeDeviceStatusListener?.();
-      this.retireSession(sessionId, displaced.session);
-      try {
+      state = {
+        session,
+        clientContext: options.clientContext,
+        lastToolCall: null,
+        toolCalls: new Map(),
+        alwaysAllowed: new Set(),
+        cancelled: false,
+        promptActive: false,
+        modeId: this.config.permissionMode,
+        cwd: options.cwd,
+        currentModel: bootstrap.model ?? this.config.model,
+        mcpServers: options.mcpServers,
+        pendingPermissions: 0,
+        lastActivityAt: Date.now(),
+        removeDeviceStatusListener: null,
+      };
+      const published = state;
+      // Runtime-side work that this adapter is not driving — a run still
+      // streaming after a turn returned, or an approval the device is waiting
+      // on — is only visible through device status. Each update refreshes the
+      // idle deadline rather than pinning the session outright: a live run
+      // keeps producing updates, while a run the runtime abandoned goes quiet
+      // and becomes evictable instead of holding its child process forever.
+      state.removeDeviceStatusListener = session.onDeviceStatus((status) => {
+        const live = this.sessions.get(sessionId);
+        if (live !== published) return;
+        if (status.isProcessing || status.pendingControlRequests.length > 0) {
+          published.lastActivityAt = Date.now();
+        }
+      });
+      if (options.prepare) await options.prepare(state);
+      // A client may load the same conversation again while its prior ACP
+      // session is still open. Retire the displaced SDK session before
+      // replacing it so its sockets and per-session MCP subprocesses are not
+      // orphaned — and if that retirement fails, the bracket releases this
+      // replacement rather than leaving two runtimes on one conversation.
+      const displaced = this.sessions.get(sessionId);
+      if (displaced && displaced.session !== session) {
+        this.sessions.delete(sessionId);
+        displaced.removeDeviceStatusListener?.();
+        this.retireSession(sessionId, displaced.session);
         await this.awaitRetirement(sessionId);
-      } catch (error) {
-        state.removeDeviceStatusListener?.();
-        await this.discardSession(sessionId, session);
-        throw error;
       }
+      // Shutdown can land in any of the awaits above, and this is the last
+      // moment before the session becomes reachable. Publishing it now would
+      // register a runtime after shutdown had already released the ones it
+      // could see, and hand it to a connection that is gone.
+      if (this.shuttingDown) throw this.shutdownRefusal(sessionId);
+      // The conversation is live again, so any eviction record for it is stale.
+      this.evicted.delete(sessionId);
+      this.startIdleSweep();
+      // Publication, and the end of this call's sole ownership: from here the
+      // runtime is reachable, and eviction and shutdown can both release it.
+      this.sessions.set(sessionId, state);
+      return { sessionId, state };
+    } catch (error) {
+      state?.removeDeviceStatusListener?.();
+      this.releaseUnpublished(opened, session);
+      throw error;
     }
-    // Publication. Shutdown can land in any of the awaits above — the
-    // runtime's own bootstrap, `prepare`, a displaced runtime's retirement —
-    // and this is the last moment before the session becomes reachable.
-    // Publishing it now would register a runtime after shutdown had already
-    // released the ones it could see, and hand it to a connection that is
-    // gone. Nothing has seen this runtime, so it is unambiguously this call's
-    // to release — through retirement rather than a best-effort discard, so a
-    // disposal that rejects stays named by `unreleasedRuntimes()` instead of
-    // only in the log. Any retirement for this conversation was awaited to get
-    // here, so there is no record to displace.
-    if (this.shuttingDown) {
-      state.removeDeviceStatusListener?.();
-      this.retireSession(sessionId, session);
-      throw this.shutdownRefusal(sessionId);
-    }
-    this.sessions.set(sessionId, state);
-    // The conversation is live again, so any eviction record for it is stale.
-    this.evicted.delete(sessionId);
-    this.startIdleSweep();
-    return { sessionId, state };
   }
 
   private announceCommands(sessionId: string, cx: AgentContext): void {
@@ -1177,19 +1198,73 @@ export class LettaAcpAgent {
   }
 
   /**
-   * Best-effort release for a runtime nothing can reopen behind: a session no
-   * caller has seen, or one left over at shutdown. There is no later request
-   * to fail closed, so the failure is logged rather than retained.
+   * Starts a disposal and records its outcome, leaving who owns the record to
+   * the caller.
+   *
+   * Both kinds of ownership need the same two guarantees: the record exists
+   * before the disposal can settle, so nothing can slip in behind a release
+   * still in flight, and a rejection is kept on the record rather than logged
+   * and dropped, so the handle stays accountable.
    */
-  private async discardSession(
-    sessionId: string,
+  private beginRelease<T extends HeldRuntime>(
+    record: T,
+    describeFailure: (error: unknown) => string,
+  ): T {
+    record.settled = this.disposeSession(record.session).catch(
+      (error: unknown) => {
+        record.failed = true;
+        record.error = error;
+        log(describeFailure(error));
+      },
+    );
+    return record;
+  }
+
+  /**
+   * Releases a runtime an initialization owned but never published, and keeps
+   * it inspectable if that release fails.
+   *
+   * The alternative this replaces was a best-effort discard, which logged a
+   * disposal failure and forgot the handle. Nothing had seen the runtime, so
+   * nothing else would ever account for it: it is exactly the case where the
+   * adapter is the only party that knows a child process may still be alive.
+   * Held by identity rather than by conversation, so a handle whose runtime
+   * never reported an id is still named as unreleased, and a failure arriving
+   * while an older retirement already owns the conversation adds to that
+   * record instead of overwriting the error it carries.
+   */
+  private releaseUnpublished(
+    sessionId: string | null,
     session: LettaCodeSession,
-  ): Promise<void> {
-    try {
-      await this.disposeSession(session);
-    } catch (error) {
-      log(`discarding session ${sessionId} failed: ${String(error)}`);
-    }
+  ): void {
+    const named = describeHandle(sessionId);
+    const record = this.beginRelease<UnpublishedRuntime>(
+      {
+        session,
+        sessionId,
+        settled: Promise.resolve(),
+        failed: false,
+        error: undefined,
+        finalCloseAttempted: false,
+      },
+      (error) =>
+        `releasing unpublished runtime for ${named} failed; holding it: ${String(error)}`,
+    );
+    this.unpublished.add(record);
+    void record.settled.then(() => {
+      if (!record.failed) {
+        this.unpublished.delete(record);
+        return;
+      }
+      // Same reason retirement covers this from here: a disposal that rejects
+      // after shutdown has no later request to fail closed for, and shutdown
+      // itself could only see a record that had already settled.
+      if (this.shuttingDown) {
+        this.releaseHeldRuntime(named, record, () =>
+          this.unpublished.delete(record),
+        );
+      }
+    });
   }
 
   /**
@@ -1206,33 +1281,33 @@ export class LettaAcpAgent {
   private retireSession(
     sessionId: string,
     session: LettaCodeSession,
-  ): RetiringRuntime {
-    const record: RetiringRuntime = {
-      session,
-      settled: Promise.resolve(),
-      failed: false,
-      error: undefined,
-      finalCloseAttempted: false,
-    };
-    record.settled = this.disposeSession(session).catch((error: unknown) => {
-      record.failed = true;
-      record.error = error;
-      log(
+  ): HeldRuntime {
+    const record = this.beginRelease<HeldRuntime>(
+      {
+        session,
+        settled: Promise.resolve(),
+        failed: false,
+        error: undefined,
+        finalCloseAttempted: false,
+      },
+      (error) =>
         `releasing session ${sessionId} failed; holding its runtime: ${String(error)}`,
-      );
-    });
+    );
     this.retiring.set(sessionId, record);
+    const forget = () => {
+      if (this.retiring.get(sessionId) === record) {
+        this.retiring.delete(sessionId);
+      }
+    };
     void record.settled.then(() => {
       if (!record.failed) {
-        if (this.retiring.get(sessionId) === record) {
-          this.retiring.delete(sessionId);
-        }
+        forget();
         return;
       }
       // A disposal that rejects after shutdown has no later request to fail
       // closed for either, so shutdown's final release has to cover it from
       // here: shutdown itself could only see a record that had not settled yet.
-      if (this.shuttingDown) this.releaseHeldRuntime(sessionId, record);
+      if (this.shuttingDown) this.releaseHeldRuntime(sessionId, record, forget);
     });
     return record;
   }
@@ -1244,27 +1319,34 @@ export class LettaAcpAgent {
    * This is not a retry offered as proof of retirement. By shutdown there is no
    * request left to fail closed and no reopen that could put a second runtime
    * on the conversation, so the only choice left is to close the handle or keep
-   * it: a close that returns released the child process, and its record goes
-   * with it; one that throws leaves the record in place, so
-   * {@link unreleasedRuntimes} still names a runtime nobody proved dead rather
-   * than dropping it. Attempted at most once per runtime, so a repeated
-   * shutdown neither closes again nor rewrites the first outcome.
+   * it.
+   *
+   * What a returning `close()` establishes is narrow: this adapter let go of
+   * the handle and its app-server socket without erroring. It is not evidence
+   * that the app-server child process or the per-session MCP subprocesses
+   * died — only async disposal waits for that teardown, and the reason this
+   * runtime is here is that disposal rejected. The record is dropped anyway
+   * because nothing further is available to do with the handle, not because
+   * anything was proved about the processes behind it; `close()` throwing is
+   * the one case where the handle itself is still unaccounted for, so the
+   * record stays and {@link unreleasedRuntimes} keeps naming it. Attempted at
+   * most once per runtime, so a repeated shutdown neither closes again nor
+   * rewrites the first outcome.
    */
   private releaseHeldRuntime(
-    sessionId: string,
-    record: RetiringRuntime,
+    named: string,
+    record: HeldRuntime,
+    forget: () => void,
   ): void {
     if (record.finalCloseAttempted) return;
     record.finalCloseAttempted = true;
     try {
       record.session.close();
     } catch (error) {
-      log(`closing held runtime for ${sessionId} failed: ${String(error)}`);
+      log(`closing held runtime for ${named} failed: ${String(error)}`);
       return;
     }
-    if (this.retiring.get(sessionId) === record) {
-      this.retiring.delete(sessionId);
-    }
+    forget();
   }
 
   /**
@@ -1288,31 +1370,63 @@ export class LettaAcpAgent {
   }
 
   /**
-   * Waits for an in-flight retirement of this conversation's runtime, and
-   * refuses to continue when that retirement failed.
+   * Waits for every release in flight against this conversation's runtime, and
+   * refuses to continue when one of them failed.
+   *
+   * Unpublished handles count here as much as retirements do. A runtime whose
+   * initialization failed after it was already resuming the conversation is
+   * still on that conversation; letting a reopen past it would start the
+   * second runtime this guards against just as surely.
    */
   private async awaitRetirement(sessionId: string): Promise<void> {
     const record = this.retiring.get(sessionId);
-    if (!record) return;
-    await record.settled;
-    if (record.failed) {
+    const unpublished = [...this.unpublished].filter(
+      (held) => held.sessionId === sessionId,
+    );
+    await Promise.all([
+      record?.settled,
+      ...unpublished.map((held) => held.settled),
+    ]);
+    if (record?.failed) {
       throw new SessionRetirementError(sessionId, record.error);
+    }
+    const unreleased = unpublished.find((held) => held.failed);
+    if (unreleased) {
+      throw new SessionRetirementError(sessionId, unreleased.error);
     }
   }
 
   /**
-   * Conversations whose runtime this adapter could not release, with the
-   * failure that left each one unreconciled.
+   * Runtimes this adapter could not release, with the failure that left each
+   * one unreconciled, named by conversation where one is known.
    *
    * These are refusing to reopen, so surface them rather than leaving an
    * operator to infer them from the log.
    */
-  unreleasedRuntimes(): Array<{ sessionId: string; error: unknown }> {
-    const held: Array<{ sessionId: string; error: unknown }> = [];
+  unreleasedRuntimes(): Array<{ sessionId: string | null; error: unknown }> {
+    const held: Array<{ sessionId: string | null; error: unknown }> = [];
     for (const [sessionId, record] of this.retiring) {
       if (record.failed) held.push({ sessionId, error: record.error });
     }
+    for (const record of this.unpublished) {
+      if (record.failed) {
+        held.push({ sessionId: record.sessionId, error: record.error });
+      }
+    }
     return held;
+  }
+
+  /**
+   * The settled, failed release this conversation is still held by, whether it
+   * was a retirement or an initialization that never published its runtime.
+   */
+  private unreleasedRuntimeFor(sessionId: string): HeldRuntime | undefined {
+    const retiring = this.retiring.get(sessionId);
+    if (retiring?.failed) return retiring;
+    for (const record of this.unpublished) {
+      if (record.failed && record.sessionId === sessionId) return record;
+    }
+    return undefined;
   }
 
   /**
@@ -1336,9 +1450,9 @@ export class LettaAcpAgent {
     if (live) return live;
     // Reported before the eviction record is consulted, so the refusal keeps
     // naming the unreleased runtime even once that record has aged out.
-    const retiring = this.retiring.get(sessionId);
-    if (retiring?.failed) {
-      throw new SessionRetirementError(sessionId, retiring.error);
+    const unreleased = this.unreleasedRuntimeFor(sessionId);
+    if (unreleased) {
+      throw new SessionRetirementError(sessionId, unreleased.error);
     }
     const saved = this.evicted.get(sessionId);
     if (!saved || this.shuttingDown) return undefined;
@@ -1458,7 +1572,20 @@ export class LettaAcpAgent {
     // those as they settle, which is also why nothing clears the map — what
     // remains in it is exactly what this adapter could not release.
     for (const [sessionId, record] of [...this.retiring]) {
-      if (record.failed) this.releaseHeldRuntime(sessionId, record);
+      if (!record.failed) continue;
+      this.releaseHeldRuntime(sessionId, record, () => {
+        if (this.retiring.get(sessionId) === record) {
+          this.retiring.delete(sessionId);
+        }
+      });
+    }
+    // Handles an initialization never published are in the same position: no
+    // caller ever saw them, so shutdown is the last place that can let go.
+    for (const record of [...this.unpublished]) {
+      if (!record.failed) continue;
+      this.releaseHeldRuntime(describeHandle(record.sessionId), record, () =>
+        this.unpublished.delete(record),
+      );
     }
   }
 

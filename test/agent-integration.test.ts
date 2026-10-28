@@ -2047,6 +2047,58 @@ describe("idle session eviction", () => {
     return server.runtimeStartMessages.map((message) => message.conversation_id);
   }
 
+  /**
+   * Makes every later session's bootstrap reject after the real SDK call
+   * returned, which is the moment the adapter owns a started runtime that
+   * nothing else can see yet.
+   */
+  function failBootstrapWith(agent: LettaAcpAgent, error: Error): void {
+    const client = (agent as unknown as { client: SdkClientHandle }).client;
+    const createSession = client.createSession.bind(client);
+    const resumeSession = client.resumeSession.bind(client);
+    const inject = (session: SdkSessionHandle): SdkSessionHandle => {
+      const runtime = session as unknown as {
+        bootstrapState: (...args: unknown[]) => Promise<unknown>;
+      };
+      const bootstrap = runtime.bootstrapState.bind(runtime);
+      runtime.bootstrapState = async (...args) => {
+        await bootstrap(...args);
+        throw error;
+      };
+      return session;
+    };
+    client.createSession = (agentId, options) =>
+      inject(createSession(agentId, options));
+    client.resumeSession = (conversationId, options) =>
+      inject(resumeSession(conversationId, options));
+  }
+
+  /**
+   * Drives the adapter's one session-opening path directly, for the parts of
+   * its contract no ACP request can reach today: a `prepare` that rejects, and
+   * an initialization racing another caller onto the same conversation.
+   */
+  function openSessionDirectly(
+    agent: LettaAcpAgent,
+    options: {
+      resumeId: string;
+      clientContext: AgentContext;
+      prepare?: (state: unknown) => Promise<void>;
+    },
+  ): Promise<unknown> {
+    const open = (
+      agent as unknown as {
+        openSession(request: Record<string, unknown>): Promise<unknown>;
+      }
+    ).openSession;
+    return open.call(agent, {
+      cwd: "/tmp/letta-acp-test",
+      agentId: null,
+      mcpServers: [],
+      ...options,
+    });
+  }
+
   test("closes a session that has been idle past the window", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server, {
@@ -2854,6 +2906,268 @@ describe("idle session eviction", () => {
         ),
       ).rejects.toThrow(/Unknown session/);
       expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("review regression: bootstrap rejection after shutdown retains or releases its runtime", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const { context } = createContext();
+    const client = (agent as unknown as { client: SdkClientHandle }).client;
+    const resume = client.resumeSession.bind(client);
+    let disposeCalls = 0;
+    let cleanup: (() => Promise<void>) | undefined;
+    client.resumeSession = (id, options) => {
+      const session = resume(id, options);
+      const runtime = session as unknown as {
+        bootstrapState: (...args: unknown[]) => Promise<unknown>;
+      };
+      const bootstrap = runtime.bootstrapState.bind(runtime);
+      runtime.bootstrapState = async (...args) => {
+        await bootstrap(...args);
+        throw new Error("injected bootstrap read failure");
+      };
+      const dispose = session[Symbol.asyncDispose]?.bind(session);
+      cleanup = dispose;
+      session[Symbol.asyncDispose] = async () => {
+        disposeCalls++;
+        await dispose?.();
+      };
+      return session;
+    };
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const release = server.blockRuntimeStart();
+      const load = agent.loadSession({ sessionId: "conv-bootstrap-error", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+      const outcome = load.then(() => "resolved", (e: Error) => e.message);
+      await waitFor("bootstrap runtime start", () => server.runtimeStartMessages.length === 1);
+      const closedBefore = server.closedSockets;
+      agent.shutdown();
+      release();
+      expect(await outcome).toContain("bootstrap read failure");
+      await Bun.sleep(30);
+      // A rejected read is not proof that the SDK runtime was released.
+      expect(server.closedSockets > closedBefore || agent.unreleasedRuntimes().length > 0).toBe(true);
+      expect(disposeCalls + agent.unreleasedRuntimes().length).toBeGreaterThan(0);
+    } finally {
+      agent.shutdown();
+      await cleanup?.();
+    }
+  });
+
+  test("a bootstrap rejection releases the runtime it had already started", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      failBootstrapWith(agent, new Error("injected bootstrap read failure"));
+      const closedBefore = server.closedSockets;
+
+      // No shutdown here: an initialization that fails on an ordinary request
+      // owns a started runtime just as much as one interrupted by shutdown.
+      await expect(
+        agent.loadSession(
+          {
+            sessionId: "conv-bootstrap-live",
+            cwd: "/tmp/letta-acp-test",
+            mcpServers: [],
+          },
+          context,
+        ),
+      ).rejects.toThrow("injected bootstrap read failure");
+      expect(server.runtimeStartMessages).toHaveLength(1);
+
+      await waitFor(
+        "the runtime the failed bootstrap started to be released",
+        () => server.closedSockets > closedBefore,
+      );
+      // Released, so nothing is being held and the conversation is free to be
+      // opened again.
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a bootstrap rejection nobody could release keeps the conversation", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const failure = new Error("injected disposal failure");
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      failBootstrapWith(agent, new Error("injected bootstrap read failure"));
+      const disposal = sdk.deferNextDisposal();
+
+      // The caller still gets the failure it asked about, not the disposal's.
+      await expect(
+        agent.loadSession(
+          {
+            sessionId: "conv-bootstrap-held",
+            cwd: "/tmp/letta-acp-test",
+            mcpServers: [],
+          },
+          context,
+        ),
+      ).rejects.toThrow("injected bootstrap read failure");
+      await waitFor(
+        "the unpublished runtime's release to start",
+        () => disposal.started,
+      );
+      disposal.reject(failure);
+      await waitFor(
+        "the unreleased runtime to be recorded",
+        () => agent.unreleasedRuntimes().length === 1,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual([
+        { sessionId: "conv-bootstrap-held", error: failure },
+      ]);
+
+      // A runtime that was resuming this conversation is still on it, so the
+      // conversation is held exactly as a failed retirement holds one: loading
+      // it again would be the second runtime, not a retry.
+      await expect(
+        agent.loadSession(
+          {
+            sessionId: "conv-bootstrap-held",
+            cwd: "/tmp/letta-acp-test",
+            mcpServers: [],
+          },
+          context,
+        ),
+      ).rejects.toThrow(SessionRetirementError);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+
+      // Shutdown is where the handle is finally let go, as it is for a failed
+      // retirement.
+      agent.shutdown();
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a prepare that fails releases the runtime it was preparing", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const failure = new Error("injected disposal failure");
+    const held = [{ sessionId: "conv-prepare-held", error: failure }];
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const disposal = sdk.deferNextDisposal();
+      sdk.failCloseWith(new Error("injected close failure"));
+
+      // Reopen's own `prepare` swallows the one call that can fail today, so
+      // the hook is driven directly: this covers the contract the
+      // initialization bracket owes every `prepare`, not today's single one.
+      const open = openSessionDirectly(agent, {
+        resumeId: "conv-prepare-held",
+        clientContext: context,
+        prepare: async () => {
+          throw new Error("injected prepare failure");
+        },
+      });
+      await expect(open).rejects.toThrow("injected prepare failure");
+
+      await waitFor(
+        "the unpublished runtime's release to start",
+        () => disposal.started,
+      );
+      disposal.reject(failure);
+      await waitFor(
+        "the unreleased runtime to be recorded",
+        () => agent.unreleasedRuntimes().length === 1,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual(held);
+
+      // Neither way of letting go worked, so the handle stays named rather
+      // than being dropped, and a repeated shutdown is not a second attempt.
+      agent.shutdown();
+      expect(agent.unreleasedRuntimes()).toEqual(held);
+      agent.shutdown();
+      expect(agent.unreleasedRuntimes()).toEqual(held);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("an unpublished runtime does not overwrite the retirement already holding its conversation", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: 0,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const displacedFailure = new Error("injected displaced disposal failure");
+    const handleFailure = new Error("injected unpublished disposal failure");
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      // One conversation, two runtimes: this initialization is mid-flight when
+      // another caller publishes the same conversation, so it has to retire
+      // what it displaces before it can publish its own.
+      let displacedDisposal: DeferredDisposal | null = null;
+      const open = openSessionDirectly(agent, {
+        resumeId: "conv-displaced-held",
+        clientContext: context,
+        prepare: async () => {
+          await agent.loadSession(
+            {
+              sessionId: "conv-displaced-held",
+              cwd: "/tmp/letta-acp-test",
+              mcpServers: [],
+            },
+            context,
+          );
+          displacedDisposal = sdk.deferNextDisposal();
+        },
+      });
+      await waitFor(
+        "the displaced runtime's retirement to start",
+        () => displacedDisposal?.started === true,
+      );
+
+      // Both releases fail: the retirement of the displaced runtime, and then
+      // this initialization's own handle.
+      const handleDisposal = sdk.deferNextDisposal();
+      displacedDisposal!.reject(displacedFailure);
+      await expect(open).rejects.toThrow(SessionRetirementError);
+      await waitFor(
+        "the unpublished runtime's release to start",
+        () => handleDisposal.started,
+      );
+      handleDisposal.reject(handleFailure);
+
+      // Two runtimes were started on this conversation and neither was
+      // released, so both are named with the failure that left them held. A
+      // record keyed by conversation could only have kept one of them, and the
+      // later failure would have erased the error the first one carries.
+      await waitFor(
+        "both unreleased runtimes to be recorded",
+        () => agent.unreleasedRuntimes().length === 2,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual([
+        { sessionId: "conv-displaced-held", error: displacedFailure },
+        { sessionId: "conv-displaced-held", error: handleFailure },
+      ]);
+      expect(server.runtimeStartMessages).toHaveLength(2);
     } finally {
       agent.shutdown();
     }
