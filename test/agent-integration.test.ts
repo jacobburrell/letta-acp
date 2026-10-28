@@ -744,6 +744,7 @@ function createAgent(
 /** The Letta SDK surface the adapter uses to open and release a session. */
 interface SdkSessionHandle {
   [Symbol.asyncDispose]?: () => Promise<void>;
+  close(): void;
 }
 
 interface SdkSessionOptions {
@@ -784,6 +785,7 @@ function instrumentSdkSessions(
   /** The mcpServers the adapter handed the SDK, one entry per session opened. */
   const mcpServerOptions: Array<Record<string, unknown> | undefined> = [];
   let deferred: { started: boolean; gate: Promise<void> } | null = null;
+  let closeFailure: Error | null = null;
 
   const instrument = (
     sessionOptions: SdkSessionOptions,
@@ -808,6 +810,15 @@ function instrumentSdkSessions(
           await held.gate;
         }
         await dispose?.();
+      },
+    });
+    const close = session.close.bind(session);
+    Object.defineProperty(session, "close", {
+      configurable: true,
+      writable: true,
+      value: (): void => {
+        if (closeFailure) throw closeFailure;
+        close();
       },
     });
     return session;
@@ -839,6 +850,14 @@ function instrumentSdkSessions(
         resolve: resolveGate,
         reject: rejectGate,
       };
+    },
+    /**
+     * Makes every subsequent `close()` on these sessions throw, so a test can
+     * cover the case where the adapter has no working way left to release a
+     * runtime it is holding.
+     */
+    failCloseWith(error: Error): void {
+      closeFailure = error;
     },
   };
 }
@@ -2515,6 +2534,163 @@ describe("idle session eviction", () => {
         content: { type: "text", text: "PROMPT_OK" },
       });
       expect(first.updates).toHaveLength(firstUpdatesBefore);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("review regression: shutdown retains a pending retirement that later rejects", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-shutdown-pending-close");
+      const closedBefore = server.closedSockets;
+      const disposal = sdk.deferNextDisposal();
+      await waitFor("pending retirement", () => disposal.started);
+      agent.shutdown();
+      disposal.reject(new Error("disposal rejected after shutdown"));
+      await Bun.sleep(50);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      // Shutdown must either close this owned runtime or retain its failed
+      // handle for reconciliation; clearing the map is not cleanup evidence.
+      expect(
+        server.closedSockets > closedBefore ||
+          agent.unreleasedRuntimes().some(
+            (held) => held.sessionId === "conv-shutdown-pending-close",
+          ),
+      ).toBe(true);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("shutdown keeps a pending retirement, which its own success releases", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-shutdown-pending-ok");
+      const closedBefore = server.closedSockets;
+      const disposal = sdk.deferNextDisposal();
+      await waitFor(
+        "the eviction to start disposing the session",
+        () => disposal.started,
+      );
+
+      // Shutdown lands before the outcome is known, so it cannot yet decide
+      // whether this runtime was released or is being held.
+      agent.shutdown();
+      expect(server.closedSockets).toBe(closedBefore);
+
+      disposal.resolve();
+
+      // The disposal itself released the runtime, so there is nothing for
+      // shutdown to close and nothing left held.
+      await waitFor(
+        "the pending disposal to release the runtime",
+        () => server.closedSockets > closedBefore,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a close failure at shutdown stays inspectable, and is not retried", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const failure = new Error("injected disposal failure");
+    const held = [{ sessionId: "conv-shutdown-close-fails", error: failure }];
+    try {
+      await loadConversation(agent, context, "conv-shutdown-close-fails");
+      const closedBefore = server.closedSockets;
+      const disposal = sdk.deferNextDisposal();
+      await waitFor(
+        "the eviction to start disposing the session",
+        () => disposal.started,
+      );
+      disposal.reject(failure);
+      await waitFor(
+        "the unreleased runtime to be recorded",
+        () => agent.unreleasedRuntimes().length === 1,
+      );
+
+      // The last close shutdown can reach fails too, so nothing has proved
+      // this runtime dead.
+      sdk.failCloseWith(new Error("injected close failure"));
+      agent.shutdown();
+
+      expect(server.closedSockets).toBe(closedBefore);
+      // Dropping the record here would leave a leaked child process with no
+      // trace of it beyond a log line.
+      expect(agent.unreleasedRuntimes()).toEqual(held);
+
+      // A repeated shutdown is not a second attempt: closing again proves no
+      // more than the first close did, and must not overwrite the disposal
+      // failure that is still the reason this runtime is held.
+      agent.shutdown();
+      expect(server.closedSockets).toBe(closedBefore);
+      expect(agent.unreleasedRuntimes()).toEqual(held);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a reopen waiting on a disposal when shutdown starts opens nothing", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-shutdown-midwait");
+      const closedBefore = server.closedSockets;
+      const disposal = sdk.deferNextDisposal();
+      await waitFor(
+        "the eviction to start disposing the session",
+        () => disposal.started,
+      );
+
+      // The reopen is parked on the unfinished disposal when shutdown lands.
+      const prompt = agent.prompt(
+        {
+          sessionId: "conv-shutdown-midwait",
+          prompt: [{ type: "text", text: "hi" }],
+        },
+        context,
+      );
+      await Bun.sleep(IDLE_MS);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+
+      agent.shutdown();
+      disposal.resolve();
+
+      await expect(prompt).rejects.toThrow(/during shutdown/);
+      // The old disposal settling is not permission to start a replacement:
+      // the connection that would have been served is already gone.
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      await waitFor(
+        "the evicted runtime to be released",
+        () => server.closedSockets > closedBefore,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual([]);
     } finally {
       agent.shutdown();
     }

@@ -195,6 +195,11 @@ interface RetiringRuntime {
   failed: boolean;
   /** The rejection, kept for diagnostics and for the error callers receive. */
   error: unknown;
+  /**
+   * True once shutdown's final close has been attempted for this runtime, so a
+   * repeated shutdown cannot close it twice or overwrite the first outcome.
+   */
+  finalCloseAttempted: boolean;
 }
 
 /**
@@ -1168,9 +1173,9 @@ export class LettaAcpAgent {
    * never slip between eviction and the close. A successful retirement drops
    * only its own entry; a failed one is kept, because the adapter still owns a
    * runtime it could not release (see {@link SessionRetirementError}). There
-   * is deliberately no retry: a second close proves nothing about the first
-   * failure, and treating it as proof is what would authorize the duplicate
-   * runtime this guards against.
+   * is deliberately no retry while the adapter is serving requests: a second
+   * close proves nothing about the first failure, and treating it as proof is
+   * what would authorize the duplicate runtime this guards against.
    */
   private retireSession(
     sessionId: string,
@@ -1181,6 +1186,7 @@ export class LettaAcpAgent {
       settled: Promise.resolve(),
       failed: false,
       error: undefined,
+      finalCloseAttempted: false,
     };
     record.settled = this.disposeSession(session).catch((error: unknown) => {
       record.failed = true;
@@ -1191,11 +1197,48 @@ export class LettaAcpAgent {
     });
     this.retiring.set(sessionId, record);
     void record.settled.then(() => {
-      if (!record.failed && this.retiring.get(sessionId) === record) {
-        this.retiring.delete(sessionId);
+      if (!record.failed) {
+        if (this.retiring.get(sessionId) === record) {
+          this.retiring.delete(sessionId);
+        }
+        return;
       }
+      // A disposal that rejects after shutdown has no later request to fail
+      // closed for either, so shutdown's final release has to cover it from
+      // here: shutdown itself could only see a record that had not settled yet.
+      if (this.shuttingDown) this.releaseHeldRuntime(sessionId, record);
     });
     return record;
+  }
+
+  /**
+   * Final release attempt for a runtime a failed disposal left this adapter
+   * holding, made only once shutdown has given up the ACP connection.
+   *
+   * This is not a retry offered as proof of retirement. By shutdown there is no
+   * request left to fail closed and no reopen that could put a second runtime
+   * on the conversation, so the only choice left is to close the handle or keep
+   * it: a close that returns released the child process, and its record goes
+   * with it; one that throws leaves the record in place, so
+   * {@link unreleasedRuntimes} still names a runtime nobody proved dead rather
+   * than dropping it. Attempted at most once per runtime, so a repeated
+   * shutdown neither closes again nor rewrites the first outcome.
+   */
+  private releaseHeldRuntime(
+    sessionId: string,
+    record: RetiringRuntime,
+  ): void {
+    if (record.finalCloseAttempted) return;
+    record.finalCloseAttempted = true;
+    try {
+      record.session.close();
+    } catch (error) {
+      log(`closing held runtime for ${sessionId} failed: ${String(error)}`);
+      return;
+    }
+    if (this.retiring.get(sessionId) === record) {
+      this.retiring.delete(sessionId);
+    }
   }
 
   /**
@@ -1263,6 +1306,13 @@ export class LettaAcpAgent {
       // and one that failed keeps ownership of the conversation rather than
       // letting this reopen start a second runtime behind it.
       await this.awaitRetirement(sessionId);
+      // Waiting for that release can outlast the ACP connection. Refuse before
+      // opening anything: a replacement started after shutdown is a runtime
+      // this adapter would immediately have to discard, and the conversation it
+      // would serve is already gone.
+      if (this.shuttingDown) {
+        throw new Error(`Session ${sessionId} reopened during shutdown`);
+      }
       const { state } = await this.openSession({
         cwd: saved.cwd,
         resumeId: sessionId,
@@ -1365,17 +1415,18 @@ export class LettaAcpAgent {
     // Runtimes held back by a failed disposal are released here and nowhere
     // else: the ACP connection is gone, so there is no request left to fail
     // closed for, and leaving the handle unclosed would leak the child process
-    // for the life of the adapter. Every record is dropped, so a shut-down
-    // adapter holds nothing.
-    for (const [sessionId, record] of this.retiring) {
-      if (!record.failed) continue;
-      try {
-        record.session.close();
-      } catch (error) {
-        log(`closing held runtime for ${sessionId} failed: ${String(error)}`);
-      }
+    // for the life of the adapter.
+    //
+    // A disposal still in flight keeps its record rather than being skipped and
+    // discarded. Only its outcome says whether the runtime ended up released or
+    // still held, and that outcome arrives after this loop: dropping the record
+    // here would leak the handle of every disposal that rejects from now on, and
+    // hide it from `unreleasedRuntimes()` as well. `retireSession` releases
+    // those as they settle, which is also why nothing clears the map — what
+    // remains in it is exactly what this adapter could not release.
+    for (const [sessionId, record] of [...this.retiring]) {
+      if (record.failed) this.releaseHeldRuntime(sessionId, record);
     }
-    this.retiring.clear();
   }
 
   /**
