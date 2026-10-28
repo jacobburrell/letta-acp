@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentContext, McpServer } from "@agentclientprotocol/sdk";
 import type { LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
-import { LettaAcpAgent, toSdkMcpServers } from "../src/agent.js";
+import {
+  LettaAcpAgent,
+  SessionRetirementError,
+  toSdkMcpServers,
+} from "../src/agent.js";
+import { PERMISSION_MODE_CONFIG_ID } from "../src/session-modes.js";
 import { SessionRegistry } from "../src/session-registry.js";
 
 interface RuntimeScope {
@@ -22,6 +27,12 @@ interface ServerSocket {
 
 class FakeAppServer {
   readonly runtimeStartRequestIds: string[] = [];
+  /** Full runtime_start payloads, to prove what a reopen asked the runtime for. */
+  readonly runtimeStartMessages: WireMessage[] = [];
+  /** closedSockets observed as each runtime_start arrived, for ordering checks. */
+  readonly runtimeStartClosedSockets: number[] = [];
+  private runtimeStartGate: Promise<void> | null = null;
+  private updateModelGate: Promise<void> | null = null;
   readonly createdAgentBodies: WireMessage[] = [];
   readonly createdAgentPinGlobals: unknown[] = [];
   readonly approvalResponses: WireMessage[] = [];
@@ -90,6 +101,64 @@ class FakeAppServer {
     }
 
     return FakeSocket as unknown as LettaCodeSocketConstructor;
+  }
+
+  /**
+   * Holds every later runtime_start until the returned release runs, so a test
+   * can act while a session reopen is provably still in flight.
+   */
+  blockRuntimeStart(): () => void {
+    let release = (): void => {};
+    this.runtimeStartGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return release;
+  }
+
+  /**
+   * Holds every later update_model response until the returned release runs,
+   * so a test can act while a reopen is still reapplying the saved model.
+   */
+  blockUpdateModel(): () => void {
+    let release = (): void => {};
+    this.updateModelGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return release;
+  }
+
+  /**
+   * Pushes an `update_device_status` for the active runtime, the channel a
+   * runtime uses to report that it is working or waiting on an approval.
+   */
+  pushDeviceStatus(
+    options: { isProcessing?: boolean; pendingToolName?: string } = {},
+  ): void {
+    const socket = this.activeControlSocket;
+    const runtime = this.activeRuntime;
+    if (!socket || !runtime) {
+      throw new Error("No active runtime for a device status update");
+    }
+    socket.push({
+      type: "update_device_status",
+      runtime,
+      device_status: {
+        is_online: true,
+        is_processing: options.isProcessing ?? false,
+        current_permission_mode: "standard",
+        current_working_directory: "/tmp/letta-acp-test",
+        ...(options.pendingToolName
+          ? {
+              pending_control_requests: [
+                {
+                  request_id: "pending-approval-1",
+                  request: { tool_name: options.pendingToolName },
+                },
+              ],
+            }
+          : {}),
+      },
+    });
   }
 
   /** Resolves with the next approval_response the adapter sends back. */
@@ -165,18 +234,27 @@ class FakeAppServer {
           conversation_id: conversationId,
         };
         this.runtimeStartRequestIds.push(requestId);
+        this.runtimeStartMessages.push(message);
+        this.runtimeStartClosedSockets.push(this.closedSockets);
         if (createAgent?.body) {
           this.createdAgentBodies.push(createAgent.body);
           this.createdAgentPinGlobals.push(createAgent.pin_global);
         }
-        socket.push({
-          type: "runtime_start_response",
-          request_id: requestId,
-          success: true,
-          runtime,
-          agent: { id: agentId, model: "test/model", tools: [] },
-          conversation: { id: conversationId, agent_id: agentId },
-        });
+        const respond = (): void => {
+          socket.push({
+            type: "runtime_start_response",
+            request_id: requestId,
+            success: true,
+            runtime,
+            agent: { id: agentId, model: "test/model", tools: [] },
+            conversation: { id: conversationId, agent_id: agentId },
+          });
+        };
+        if (this.runtimeStartGate) {
+          void this.runtimeStartGate.then(respond);
+        } else {
+          respond();
+        }
         return;
       }
       case "enable_memfs":
@@ -269,15 +347,22 @@ class FakeAppServer {
         const handle =
           modelHandle ??
           (modelId === "other-model" ? "test/other-model" : "test/model");
-        socket.push({
-          type: "update_model_response",
-          request_id: requiredString(message.request_id, "update_model.request_id"),
-          success: true,
-          runtime: message.runtime,
-          applied_to: "conversation",
-          model_id: modelId,
-          model_handle: handle,
-        });
+        const respond = (): void => {
+          socket.push({
+            type: "update_model_response",
+            request_id: requiredString(message.request_id, "update_model.request_id"),
+            success: true,
+            runtime: message.runtime,
+            applied_to: "conversation",
+            model_id: modelId,
+            model_handle: handle,
+          });
+        };
+        if (this.updateModelGate) {
+          void this.updateModelGate.then(respond);
+        } else {
+          respond();
+        }
         return;
       }
       case "input":
@@ -637,6 +722,7 @@ function createAgent(
     sessionRegistryScope?: string;
     outOfTurnPermissionTimeoutMs?: number;
     prematureResultGraceMs?: number;
+    idleEvictMs?: number;
   } = {},
 ): LettaAcpAgent {
   return new LettaAcpAgent({
@@ -653,6 +739,108 @@ function createAgent(
     permissionMode: "standard",
     ...overrides,
   });
+}
+
+/** The Letta SDK surface the adapter uses to open and release a session. */
+interface SdkSessionHandle {
+  [Symbol.asyncDispose]?: () => Promise<void>;
+}
+
+interface SdkSessionOptions {
+  mcpServers?: Record<string, unknown>;
+}
+
+interface SdkClientHandle {
+  createSession(agentId: string, options: SdkSessionOptions): SdkSessionHandle;
+  resumeSession(
+    conversationId: string,
+    options: SdkSessionOptions,
+  ): SdkSessionHandle;
+}
+
+/** A disposal held open, so a test can act while a session is still closing. */
+interface DeferredDisposal {
+  /** True once the adapter has asked the SDK to dispose a session. */
+  readonly started: boolean;
+  /** Lets the real disposal proceed. */
+  resolve(): void;
+  /** Fails the disposal, leaving that runtime unreleased. */
+  reject(error: unknown): void;
+}
+
+/**
+ * Instruments the agent's Letta SDK client — the adapter's only boundary with
+ * the SDK — so a test can see what each session open asks for and control when
+ * a disposal settles. Sessions are still real SDK sessions driven over the fake
+ * app-server socket.
+ */
+function instrumentSdkSessions(
+  agent: LettaAcpAgent,
+  options: { stripMcpServers?: boolean } = {},
+) {
+  const client = (agent as unknown as { client: SdkClientHandle }).client;
+  const createSession = client.createSession.bind(client);
+  const resumeSession = client.resumeSession.bind(client);
+  /** The mcpServers the adapter handed the SDK, one entry per session opened. */
+  const mcpServerOptions: Array<Record<string, unknown> | undefined> = [];
+  let deferred: { started: boolean; gate: Promise<void> } | null = null;
+
+  const instrument = (
+    sessionOptions: SdkSessionOptions,
+    open: (forwarded: SdkSessionOptions) => SdkSessionHandle,
+  ): SdkSessionHandle => {
+    mcpServerOptions.push(sessionOptions.mcpServers);
+    const forwarded = { ...sessionOptions };
+    // Letting the SDK connect these for real would spawn a subprocess or reach
+    // a network target, which these tests must never do. Record what the
+    // adapter asked for and open the session without it.
+    if (options.stripMcpServers) delete forwarded.mcpServers;
+    const session = open(forwarded);
+    const dispose = session[Symbol.asyncDispose]?.bind(session);
+    Object.defineProperty(session, Symbol.asyncDispose, {
+      configurable: true,
+      writable: true,
+      value: async (): Promise<void> => {
+        const held = deferred;
+        if (held) {
+          deferred = null;
+          held.started = true;
+          await held.gate;
+        }
+        await dispose?.();
+      },
+    });
+    return session;
+  };
+
+  client.createSession = (agentId, sessionOptions) =>
+    instrument(sessionOptions, (forwarded) => createSession(agentId, forwarded));
+  client.resumeSession = (conversationId, sessionOptions) =>
+    instrument(sessionOptions, (forwarded) =>
+      resumeSession(conversationId, forwarded),
+    );
+
+  return {
+    mcpServerOptions,
+    /** Holds the next disposal the adapter starts until the test settles it. */
+    deferNextDisposal(): DeferredDisposal {
+      let resolveGate = (): void => {};
+      let rejectGate = (_error: unknown): void => {};
+      const gate = new Promise<void>((resolve, reject) => {
+        resolveGate = resolve;
+        rejectGate = reject;
+      });
+      const held = { started: false, gate };
+      deferred = held;
+      return {
+        get started(): boolean {
+          return held.started;
+        },
+        resolve: resolveGate,
+        reject: rejectGate,
+      };
+    },
+  };
 }
 
 function createContext(
@@ -1794,6 +1982,779 @@ describe("Agent SDK app-server integration", () => {
       await agent.cancel({ sessionId: session.sessionId });
 
       expect(await prompt).toEqual({ stopReason: "cancelled" });
+    } finally {
+      agent.shutdown();
+    }
+  });
+});
+
+/**
+ * Idle sessions each pin a Letta runtime (an app-server child process and its
+ * per-session MCP subprocesses), so a long-lived adapter accumulates them
+ * without bound. These cover closing an idle session, reopening the same
+ * conversation on demand, and every case where a session must be kept.
+ */
+describe("idle session eviction", () => {
+  const IDLE_MS = 40;
+
+  /** Polls until the condition holds, so tests never hard-code sweep timing. */
+  async function waitFor(
+    label: string,
+    condition: () => boolean,
+    timeoutMs = 2_000,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}`);
+      await Bun.sleep(5);
+    }
+  }
+
+  /** Loads a conversation by id, which is the id eviction later reopens. */
+  async function loadConversation(
+    agent: LettaAcpAgent,
+    context: AgentContext,
+    sessionId: string,
+    mcpServers: McpServer[] = [],
+  ) {
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    return agent.loadSession(
+      { sessionId, cwd: "/tmp/letta-acp-test", mcpServers },
+      context,
+    );
+  }
+
+  function conversationIdsStarted(server: FakeAppServer): unknown[] {
+    return server.runtimeStartMessages.map((message) => message.conversation_id);
+  }
+
+  test("closes a session that has been idle past the window", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-idle");
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      const closedBefore = server.closedSockets;
+
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+      // Eviction releases the runtime without opening anything new.
+      expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("reopens the same conversation transparently on the next prompt", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context, updates } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-resume");
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+
+      const response = await agent.prompt(
+        { sessionId: "conv-resume", prompt: [{ type: "text", text: "hello" }] },
+        context,
+      );
+
+      expect(response).toEqual({ stopReason: "end_turn" });
+      // The reopen resumed the same conversation rather than creating one, so
+      // the client keeps its history and the ACP session id stays valid.
+      expect(server.runtimeStartMessages).toHaveLength(2);
+      expect(conversationIdsStarted(server)).toEqual([
+        "conv-resume",
+        "conv-resume",
+      ]);
+      expect(server.runtimeStartMessages[1]?.create_conversation).toBeUndefined();
+      expect(server.createdAgentBodies).toHaveLength(0);
+      expect(updates).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROMPT_OK" },
+      });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("concurrent requests after eviction share a single reopen", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-shared");
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+
+      const [prompt, mode] = await Promise.all([
+        agent.prompt(
+          { sessionId: "conv-shared", prompt: [{ type: "text", text: "hi" }] },
+          context,
+        ),
+        agent.setSessionMode(
+          { sessionId: "conv-shared", modeId: "acceptEdits" },
+          context,
+        ),
+      ]);
+
+      expect(prompt).toEqual({ stopReason: "end_turn" });
+      expect(mode).toEqual({});
+      // Two concurrent requests must not open two runtimes for one conversation.
+      expect(server.runtimeStartMessages).toHaveLength(2);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("reopens only after the evicting close has released the runtime", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-ordered");
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+      const closedAfterEviction = server.closedSockets;
+
+      await agent.prompt(
+        { sessionId: "conv-ordered", prompt: [{ type: "text", text: "hi" }] },
+        context,
+      );
+
+      // The reopen's runtime_start was issued only after the evicting close
+      // had already torn the previous runtime down.
+      expect(server.runtimeStartClosedSockets[1]).toBeGreaterThanOrEqual(
+        closedAfterEviction,
+      );
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("never evicts a session while a prompt turn is in flight", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const promptStarted = server.nextCancelablePrompt();
+      const prompt = agent.prompt(
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "cancel active prompt" }],
+        },
+        context,
+      );
+      await promptStarted;
+      const closedBefore = server.closedSockets;
+
+      // Well past the idle window, with no adapter-side activity at all.
+      await Bun.sleep(IDLE_MS * 6);
+      expect(server.closedSockets).toBe(closedBefore);
+
+      await agent.cancel({ sessionId: session.sessionId });
+      expect(await prompt).toEqual({ stopReason: "cancelled" });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("never evicts a session waiting on an out-of-turn approval", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      outOfTurnPermissionTimeoutMs: 10_000,
+      sessionRegistryDir: null,
+    });
+    // A client that never answers the permission request.
+    const { context, permissionRequests } = createContext({
+      answerPermissions: false,
+    });
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "hi" }] },
+        context,
+      );
+      server.requestPermissionAfterPrompt();
+      await waitFor(
+        "the out-of-turn permission request",
+        () => permissionRequests.length > 0,
+      );
+      const closedBefore = server.closedSockets;
+
+      await Bun.sleep(IDLE_MS * 6);
+
+      // The turn is over, so only the pending approval keeps this session.
+      expect(server.closedSockets).toBe(closedBefore);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("session/load during an active prompt reuses the live session", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const promptStarted = server.nextCancelablePrompt();
+      const prompt = agent.prompt(
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "cancel active prompt" }],
+        },
+        context,
+      );
+      await promptStarted;
+      const startsBefore = server.runtimeStartMessages.length;
+
+      await agent.loadSession(
+        {
+          sessionId: session.sessionId,
+          cwd: "/tmp/letta-acp-test",
+          mcpServers: [],
+        },
+        context,
+      );
+
+      // Displacing the prompt's session would orphan its runtime mid-turn.
+      expect(server.runtimeStartMessages).toHaveLength(startsBefore);
+
+      await agent.cancel({ sessionId: session.sessionId });
+      expect(await prompt).toEqual({ stopReason: "cancelled" });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("runtime work reported by device status defers eviction, silence ends it", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "hi" }] },
+        context,
+      );
+      const closedBefore = server.closedSockets;
+
+      // A run still working after the turn returned keeps reporting itself.
+      for (let i = 0; i < 6; i++) {
+        server.pushDeviceStatus({ isProcessing: true });
+        await Bun.sleep(IDLE_MS / 2);
+      }
+      expect(server.closedSockets).toBe(closedBefore);
+
+      // Once the runtime stops reporting, a turn it never terminated must not
+      // pin the session forever.
+      await waitFor(
+        "the silent session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("an idle window of 0 disables eviction", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: 0,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-disabled");
+      const closedBefore = server.closedSockets;
+
+      await Bun.sleep(IDLE_MS * 6);
+
+      expect(server.closedSockets).toBe(closedBefore);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("preserves the selected mode and model across a transparent reopen", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context, permissionRequests } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-context");
+      await agent.setSessionMode(
+        { sessionId: "conv-context", modeId: "acceptEdits" },
+        context,
+      );
+      await agent.setSessionConfigOption({
+        sessionId: "conv-context",
+        configId: "model",
+        value: "other-model",
+      });
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+
+      // "approval prompt" has the runtime ask to use Write, which acceptEdits
+      // auto-allows and standard does not.
+      const response = await agent.prompt(
+        {
+          sessionId: "conv-context",
+          prompt: [{ type: "text", text: "approval prompt" }],
+        },
+        context,
+      );
+
+      expect(response.stopReason).toBe("end_turn");
+      // A reopen that reset the mode would interrupt the user for an approval
+      // they had already delegated for this session.
+      expect(permissionRequests).toHaveLength(0);
+      // The conversation's selected model is reapplied to the new runtime,
+      // rather than silently reverting to the adapter default.
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "other-model" },
+        { model_handle: "test/other-model" },
+      ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a reopen landing during shutdown closes its session and fails", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-shutdown");
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+
+      // Hold the reopen open so shutdown provably lands mid-restore.
+      const releaseRuntimeStart = server.blockRuntimeStart();
+      const prompt = agent.prompt(
+        { sessionId: "conv-shutdown", prompt: [{ type: "text", text: "hi" }] },
+        context,
+      );
+      await waitFor(
+        "the reopen to reach the runtime",
+        () => server.runtimeStartMessages.length > 1,
+      );
+      const closedDuringRestore = server.closedSockets;
+
+      agent.shutdown();
+      releaseRuntimeStart();
+
+      await expect(prompt).rejects.toThrow(/during shutdown/);
+      // The session that registered after shutdown was closed, exactly once.
+      await waitFor(
+        "the late session to be closed",
+        () => server.closedSockets > closedDuringRestore,
+      );
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("forgets the oldest evicted conversations beyond the retention bound", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      // One past the retention bound, so the first conversation is dropped.
+      for (let i = 0; i <= 1000; i++) {
+        await agent.loadSession(
+          {
+            sessionId: `conv-bound-${i}`,
+            cwd: "/tmp/letta-acp-test",
+            mcpServers: [],
+          },
+          context,
+        );
+      }
+      await waitFor(
+        "every idle session to be closed",
+        () => server.closedSockets >= 1001,
+        30_000,
+      );
+
+      // The most recent eviction is still reopenable.
+      await expect(
+        agent.prompt(
+          {
+            sessionId: "conv-bound-1000",
+            prompt: [{ type: "text", text: "hi" }],
+          },
+          context,
+        ),
+      ).resolves.toEqual({ stopReason: "end_turn" });
+      // The oldest was forgotten rather than retained without bound. A client
+      // can still reach it through session/load, which reopens from its id.
+      await expect(
+        agent.prompt(
+          { sessionId: "conv-bound-0", prompt: [{ type: "text", text: "hi" }] },
+          context,
+        ),
+      ).rejects.toThrow(/Unknown session/);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("reopens for session/set_config_option, which carries no context", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-config-only");
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+
+      // The only session is evicted, so the reopen cannot borrow a context
+      // from a live one. ACP sends no context with this request.
+      const result = await agent.setSessionConfigOption({
+        sessionId: "conv-config-only",
+        configId: "model",
+        value: "other-model",
+      });
+
+      expect(
+        result.configOptions.find((option) => option.id === "model"),
+      ).toMatchObject({ currentValue: "other-model" });
+      expect(server.runtimeStartMessages).toHaveLength(2);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a reopen uses the requesting connection's client context", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const first = createContext();
+    const second = createContext();
+    try {
+      await loadConversation(agent, first.context, "conv-context-swap");
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+      const firstUpdatesBefore = first.updates.length;
+
+      await agent.prompt(
+        {
+          sessionId: "conv-context-swap",
+          prompt: [{ type: "text", text: "hi" }],
+        },
+        second.context,
+      );
+
+      // Eviction must not retain the old context: the reply belongs to the
+      // connection that asked for it.
+      expect(second.updates).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROMPT_OK" },
+      });
+      expect(first.updates).toHaveLength(firstUpdatesBefore);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a reopen waits for a disposal that is still in flight", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-slow-close");
+      const closedBefore = server.closedSockets;
+      const disposal = sdk.deferNextDisposal();
+      await waitFor(
+        "the eviction to start disposing the session",
+        () => disposal.started,
+      );
+
+      // The reopen begins while the previous runtime is provably still open,
+      // rather than after its disposal has already finished.
+      const prompt = agent.prompt(
+        { sessionId: "conv-slow-close", prompt: [{ type: "text", text: "hi" }] },
+        context,
+      );
+      await Bun.sleep(IDLE_MS * 3);
+      expect(server.closedSockets).toBe(closedBefore);
+      // No replacement runtime while the previous one is unreleased.
+      expect(server.runtimeStartMessages).toHaveLength(1);
+
+      disposal.resolve();
+
+      expect(await prompt).toEqual({ stopReason: "end_turn" });
+      expect(server.runtimeStartMessages).toHaveLength(2);
+      // The replacement was started only once the previous runtime had closed.
+      expect(server.runtimeStartClosedSockets[1]).toBeGreaterThan(closedBefore);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a failed disposal keeps the conversation instead of replacing its runtime", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-close-failure");
+      const closedBefore = server.closedSockets;
+      const disposal = sdk.deferNextDisposal();
+      await waitFor(
+        "the eviction to start disposing the session",
+        () => disposal.started,
+      );
+
+      // The reopen is already waiting on the disposal when it fails.
+      const prompt = agent.prompt(
+        {
+          sessionId: "conv-close-failure",
+          prompt: [{ type: "text", text: "hi" }],
+        },
+        context,
+      );
+      await Bun.sleep(IDLE_MS * 3);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+
+      const failure = new Error("injected disposal failure");
+      disposal.reject(failure);
+
+      // That runtime was never released, so no path may open a second one for
+      // the same conversation or report success as if it had been retired.
+      await expect(prompt).rejects.toThrow(SessionRetirementError);
+      await expect(
+        agent.prompt(
+          {
+            sessionId: "conv-close-failure",
+            prompt: [{ type: "text", text: "again" }],
+          },
+          context,
+        ),
+      ).rejects.toThrow(SessionRetirementError);
+      await expect(
+        agent.setSessionMode(
+          { sessionId: "conv-close-failure", modeId: "acceptEdits" },
+          context,
+        ),
+      ).rejects.toThrow(SessionRetirementError);
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: "conv-close-failure",
+          configId: "model",
+          value: "other-model",
+        }),
+      ).rejects.toThrow(SessionRetirementError);
+      await expect(
+        agent.loadSession(
+          {
+            sessionId: "conv-close-failure",
+            cwd: "/tmp/letta-acp-test",
+            mcpServers: [],
+          },
+          context,
+        ),
+      ).rejects.toThrow(SessionRetirementError);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      expect(server.closedSockets).toBe(closedBefore);
+
+      // The rejection is held rather than swallowed, so what the adapter is
+      // still holding, and why, is inspectable.
+      expect(agent.unreleasedRuntimes()).toEqual([
+        { sessionId: "conv-close-failure", error: failure },
+      ]);
+
+      // Shutdown releases the handle it kept: a dropped one could not be closed.
+      agent.shutdown();
+      await waitFor(
+        "shutdown to release the retained runtime",
+        () => server.closedSockets > closedBefore,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a request during a reopen waits for the restored mode and model", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-restore-race");
+      await agent.setSessionMode(
+        { sessionId: "conv-restore-race", modeId: "acceptEdits" },
+        context,
+      );
+      await agent.setSessionConfigOption({
+        sessionId: "conv-restore-race",
+        configId: "model",
+        value: "other-model",
+      });
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+
+      // Hold the reopen inside its model restoration.
+      const releaseUpdateModel = server.blockUpdateModel();
+      const modelCallsBefore = server.updatedModelPayloads.length;
+      const prompt = agent.prompt(
+        {
+          sessionId: "conv-restore-race",
+          prompt: [{ type: "text", text: "approval prompt" }],
+        },
+        context,
+      );
+      await waitFor(
+        "the reopen to reapply the saved model",
+        () => server.updatedModelPayloads.length > modelCallsBefore,
+      );
+
+      // A second request arrives while the reopen is still restoring.
+      const concurrent = agent.setSessionConfigOption({
+        sessionId: "conv-restore-race",
+        configId: PERMISSION_MODE_CONFIG_ID,
+        value: "acceptEdits",
+      });
+      await Bun.sleep(10);
+      releaseUpdateModel();
+
+      const { configOptions } = await concurrent;
+      // The concurrent caller shares the reopen instead of being handed a
+      // session whose saved model and mode have not been reapplied yet.
+      expect(
+        configOptions.find((option) => option.id === "model"),
+      ).toMatchObject({ currentValue: "other-model" });
+      expect(
+        configOptions.find((option) => option.id === PERMISSION_MODE_CONFIG_ID),
+      ).toMatchObject({ currentValue: "acceptEdits" });
+      expect(await prompt).toEqual({ stopReason: "end_turn" });
+      // Both requests were served by one reopened runtime.
+      expect(server.runtimeStartMessages).toHaveLength(2);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("replays the conversation's MCP servers to the SDK on reopen", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    // Records what the adapter asks the SDK for without letting the SDK
+    // connect: no MCP subprocess is spawned and no MCP target is contacted.
+    const sdk = instrumentSdkSessions(agent, { stripMcpServers: true });
+    const { context } = createContext();
+    const mcpServers: McpServer[] = [
+      {
+        name: "notes",
+        command: "/usr/bin/notes-mcp",
+        args: ["--stdio"],
+        env: [{ name: "NOTES_TOKEN", value: "notes-token" }],
+      },
+      {
+        type: "http",
+        name: "docs",
+        url: "https://docs.invalid/mcp",
+        headers: [{ name: "Authorization", value: "Bearer docs-token" }],
+      },
+    ];
+    try {
+      await loadConversation(agent, context, "conv-mcp-replay", mcpServers);
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+
+      await agent.prompt(
+        { sessionId: "conv-mcp-replay", prompt: [{ type: "text", text: "hi" }] },
+        context,
+      );
+
+      expect(server.runtimeStartMessages).toHaveLength(2);
+      // The reopened session is configured with exactly the servers the client
+      // supplied for the original session.
+      expect(sdk.mcpServerOptions).toEqual([
+        toSdkMcpServers(mcpServers),
+        toSdkMcpServers(mcpServers),
+      ]);
     } finally {
       agent.shutdown();
     }
