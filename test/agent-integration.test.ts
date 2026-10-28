@@ -2696,6 +2696,284 @@ describe("idle session eviction", () => {
     }
   });
 
+  test("review regression: load waiting for retirement cannot start after shutdown", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { idleEvictMs: IDLE_MS, sessionRegistryDir: null });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-load-shutdown");
+      const disposal = sdk.deferNextDisposal();
+      await waitFor("pending retirement", () => disposal.started);
+      const load = agent.loadSession({ sessionId: "conv-load-shutdown", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+      const result = load.then(() => "resolved", () => "rejected");
+      await Bun.sleep(IDLE_MS);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      agent.shutdown();
+      disposal.resolve();
+      await result;
+      expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("an explicit load waits for a pending retirement, then opens one replacement", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-load-wait-ok");
+      const closedBefore = server.closedSockets;
+      const disposal = sdk.deferNextDisposal();
+      await waitFor(
+        "the eviction to start disposing the session",
+        () => disposal.started,
+      );
+
+      // The load is parked on the unfinished disposal rather than racing it.
+      const load = agent.loadSession(
+        {
+          sessionId: "conv-load-wait-ok",
+          cwd: "/tmp/letta-acp-test",
+          mcpServers: [],
+        },
+        context,
+      );
+      await Bun.sleep(IDLE_MS * 3);
+      expect(server.closedSockets).toBe(closedBefore);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+
+      disposal.resolve();
+
+      await load;
+      // Waiting is not refusing: a retirement that succeeds lets the load
+      // through, and it opens one replacement, after the previous close.
+      expect(server.runtimeStartMessages).toHaveLength(2);
+      expect(server.runtimeStartClosedSockets[1]).toBeGreaterThan(closedBefore);
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("an explicit load waiting on a retirement that fails opens nothing", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const failure = new Error("injected disposal failure");
+    try {
+      await loadConversation(agent, context, "conv-load-wait-fail");
+      const disposal = sdk.deferNextDisposal();
+      await waitFor(
+        "the eviction to start disposing the session",
+        () => disposal.started,
+      );
+
+      const load = agent.loadSession(
+        {
+          sessionId: "conv-load-wait-fail",
+          cwd: "/tmp/letta-acp-test",
+          mcpServers: [],
+        },
+        context,
+      );
+      await Bun.sleep(IDLE_MS);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+
+      disposal.reject(failure);
+
+      // An explicit load is not a way around a runtime nobody released: it
+      // would put the second runtime on the conversation that eviction exists
+      // to prevent.
+      await expect(load).rejects.toThrow(SessionRetirementError);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+      expect(agent.unreleasedRuntimes()).toEqual([
+        { sessionId: "conv-load-wait-fail", error: failure },
+      ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("shutdown during an explicit load's bootstrap publishes nothing", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      // Hold the runtime open so shutdown provably lands mid-bootstrap, with
+      // the runtime started but not yet registered against its conversation.
+      const releaseRuntimeStart = server.blockRuntimeStart();
+      const load = agent.loadSession(
+        {
+          sessionId: "conv-load-bootstrap",
+          cwd: "/tmp/letta-acp-test",
+          mcpServers: [],
+        },
+        context,
+      );
+      await waitFor(
+        "the load to reach the runtime",
+        () => server.runtimeStartMessages.length === 1,
+      );
+      const closedDuringBootstrap = server.closedSockets;
+
+      agent.shutdown();
+      releaseRuntimeStart();
+
+      await expect(load).rejects.toThrow(/during shutdown/);
+      // Shutdown could not see this runtime to close it, so the publication
+      // fence had to release it instead of handing it out.
+      await waitFor(
+        "the unpublished runtime to be released",
+        () => server.closedSockets > closedDuringBootstrap,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+      // And it was released rather than published: the conversation is not
+      // reachable through the adapter afterwards.
+      await expect(
+        agent.prompt(
+          {
+            sessionId: "conv-load-bootstrap",
+            prompt: [{ type: "text", text: "hi" }],
+          },
+          context,
+        ),
+      ).rejects.toThrow(/Unknown session/);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("an unpublished runtime nobody could release stays inspectable", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const sdk = instrumentSdkSessions(agent);
+    const { context } = createContext();
+    const failure = new Error("injected disposal failure");
+    const held = [{ sessionId: "conv-load-bootstrap-held", error: failure }];
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+      const releaseRuntimeStart = server.blockRuntimeStart();
+      const load = agent.loadSession(
+        {
+          sessionId: "conv-load-bootstrap-held",
+          cwd: "/tmp/letta-acp-test",
+          mcpServers: [],
+        },
+        context,
+      );
+      await waitFor(
+        "the load to reach the runtime",
+        () => server.runtimeStartMessages.length === 1,
+      );
+
+      // Shutdown lands mid-bootstrap, and neither way of letting go of this
+      // runtime works afterwards.
+      agent.shutdown();
+      const disposal = sdk.deferNextDisposal();
+      sdk.failCloseWith(new Error("injected close failure"));
+      releaseRuntimeStart();
+
+      await expect(load).rejects.toThrow(/during shutdown/);
+      await waitFor(
+        "the unpublished runtime's release to start",
+        () => disposal.started,
+      );
+      disposal.reject(failure);
+
+      // The handle is still this adapter's, so refusing to publish must not
+      // also mean forgetting it: a best-effort discard here would leave a
+      // runtime nobody proved dead with no trace beyond a log line.
+      await waitFor(
+        "the unreleased runtime to be recorded",
+        () => agent.unreleasedRuntimes().length === 1,
+      );
+      expect(agent.unreleasedRuntimes()).toEqual(held);
+
+      // And a repeated shutdown is still not a second attempt at it.
+      agent.shutdown();
+      expect(agent.unreleasedRuntimes()).toEqual(held);
+      expect(server.runtimeStartMessages).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("shutdown closes admission for new, load and implicit reopen alike", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      idleEvictMs: IDLE_MS,
+      sessionRegistryDir: null,
+    });
+    const { context } = createContext();
+    try {
+      await loadConversation(agent, context, "conv-closed-admission");
+      const closedBefore = server.closedSockets;
+      await waitFor(
+        "the idle session to be closed",
+        () => server.closedSockets > closedBefore,
+      );
+      const startsBefore = server.runtimeStartMessages.length;
+
+      agent.shutdown();
+
+      // session/new: admitted at the one place that spawns, with no
+      // conversation id of its own to name yet.
+      await expect(
+        agent.newSession({ cwd: "/tmp/letta-acp-test", mcpServers: [] }, context),
+      ).rejects.toThrow(/during shutdown/);
+      // session/load for a conversation this adapter has already served, which
+      // is the sibling path that reached the spawn site unguarded.
+      await expect(
+        agent.loadSession(
+          {
+            sessionId: "conv-closed-admission",
+            cwd: "/tmp/letta-acp-test",
+            mcpServers: [],
+          },
+          context,
+        ),
+      ).rejects.toThrow(/during shutdown/);
+      // An implicit reopen never gets as far as the fence: shutdown gave up
+      // what it remembered about evicted conversations, so there is nothing to
+      // reopen rather than a reopen to refuse. (The fence itself covers the
+      // reopen that was already in flight — see the mid-restore cases above.)
+      await expect(
+        agent.prompt(
+          {
+            sessionId: "conv-closed-admission",
+            prompt: [{ type: "text", text: "hi" }],
+          },
+          context,
+        ),
+      ).rejects.toThrow(/Unknown session/);
+
+      expect(server.runtimeStartMessages).toHaveLength(startsBefore);
+      expect(agent.unreleasedRuntimes()).toEqual([]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
   test("a reopen waits for a disposal that is still in flight", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server, {

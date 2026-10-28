@@ -596,6 +596,12 @@ export class LettaAcpAgent {
    *
    * The harness always runs with permissionMode "standard"; the ACP-selected
    * mode is enforced adapter-side (see session-modes.ts).
+   *
+   * This is also the adapter's shutdown fence, in both directions: nothing
+   * spawns a runtime without passing the admission check below, and nothing
+   * becomes reachable without passing the publication check before
+   * `sessions.set`. Callers deliberately do not carry their own copies — see
+   * {@link shutdownRefusal}.
    */
   private async openSession(options: {
     cwd: string;
@@ -606,6 +612,11 @@ export class LettaAcpAgent {
     /** Restores conversation-scoped state before the session is published. */
     prepare?: (state: AcpSessionState) => Promise<void>;
   }): Promise<{ sessionId: string; state: AcpSessionState }> {
+    // Admission. Every caller reaches this line having already awaited
+    // something since it was admitted — the agent lookup, a reopen in flight,
+    // a pending retirement of this very conversation — so being admitted
+    // before shutdown says nothing about now.
+    if (this.shuttingDown) throw this.shutdownRefusal(options.resumeId);
     this.lastClientContext = options.clientContext;
     const ref = { sessionId: options.resumeId ?? "" };
     const editorTools = createEditorTools(this.clientFsCaps, {
@@ -704,6 +715,21 @@ export class LettaAcpAgent {
         await this.discardSession(sessionId, session);
         throw error;
       }
+    }
+    // Publication. Shutdown can land in any of the awaits above — the
+    // runtime's own bootstrap, `prepare`, a displaced runtime's retirement —
+    // and this is the last moment before the session becomes reachable.
+    // Publishing it now would register a runtime after shutdown had already
+    // released the ones it could see, and hand it to a connection that is
+    // gone. Nothing has seen this runtime, so it is unambiguously this call's
+    // to release — through retirement rather than a best-effort discard, so a
+    // disposal that rejects stays named by `unreleasedRuntimes()` instead of
+    // only in the log. Any retirement for this conversation was awaited to get
+    // here, so there is no record to displace.
+    if (this.shuttingDown) {
+      state.removeDeviceStatusListener?.();
+      this.retireSession(sessionId, session);
+      throw this.shutdownRefusal(sessionId);
     }
     this.sessions.set(sessionId, state);
     // The conversation is live again, so any eviction record for it is stale.
@@ -1242,6 +1268,26 @@ export class LettaAcpAgent {
   }
 
   /**
+   * The refusal both halves of {@link openSession}'s shutdown fence throw.
+   *
+   * Shutdown gives up the ACP connection and releases every runtime it can
+   * see, so a runtime started or published after it serves no client and
+   * nothing is left to notice it. There is deliberately one fence rather than a
+   * check per entry point: `session/new`, `session/load` and an implicit reopen
+   * are three admission paths onto one spawn site, and guarding them
+   * individually is what left the explicit load unguarded twice over. Names the
+   * conversation when the caller has one; `session/new` has no id until its
+   * runtime reports one.
+   */
+  private shutdownRefusal(sessionId: string | null): Error {
+    return new Error(
+      sessionId
+        ? `Cannot open session ${sessionId} during shutdown`
+        : "Cannot open a session during shutdown",
+    );
+  }
+
+  /**
    * Waits for an in-flight retirement of this conversation's runtime, and
    * refuses to continue when that retirement failed.
    */
@@ -1306,13 +1352,10 @@ export class LettaAcpAgent {
       // and one that failed keeps ownership of the conversation rather than
       // letting this reopen start a second runtime behind it.
       await this.awaitRetirement(sessionId);
-      // Waiting for that release can outlast the ACP connection. Refuse before
-      // opening anything: a replacement started after shutdown is a runtime
-      // this adapter would immediately have to discard, and the conversation it
-      // would serve is already gone.
-      if (this.shuttingDown) {
-        throw new Error(`Session ${sessionId} reopened during shutdown`);
-      }
+      // Waiting for that release can outlast the ACP connection, and so can
+      // the reopen itself. Both are refused by openSession's shutdown fence,
+      // which every other way of starting a runtime goes through too; adding a
+      // check here again would only make the next unguarded path harder to see.
       const { state } = await this.openSession({
         cwd: saved.cwd,
         resumeId: sessionId,
@@ -1338,16 +1381,6 @@ export class LettaAcpAgent {
           }
         },
       });
-      // shutdown() closes and clears the sessions it can see, so a session
-      // that registered after it must clean up here — exactly once.
-      if (this.shuttingDown) {
-        if (this.sessions.get(sessionId) === state) {
-          this.sessions.delete(sessionId);
-          state.removeDeviceStatusListener?.();
-          await this.discardSession(sessionId, state.session);
-        }
-        throw new Error(`Session ${sessionId} reopened during shutdown`);
-      }
       log(`reopened evicted session ${sessionId}`);
       return state;
     })().finally(() => this.restoring.delete(sessionId));
